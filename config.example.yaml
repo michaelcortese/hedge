@@ -9,7 +9,7 @@ kalshi:
     demo:
       base_url: https://demo-api.kalshi.co/trade-api/v2
       # API Key ID (UUID) from the Kalshi DEMO web UI.
-      key_id: "REPLACE_DEMO_KEY_ID"
+      key_id: "4abb2271-1e6f-439f-8194-c798c328c455"
       # PEM that demo showed you once at key creation.
       private_key_path: secrets/kalshi_demo_private_key.pem
     prod:
@@ -30,3 +30,22 @@ risk:
   market_cap_frac: 0.03    # max bankroll fraction per market
   portfolio_cap: 0.30      # max total at-risk fraction
   rebalance_band: 0.25     # only rebalance if target drifts > this fraction
+  max_order_dollars: 25.0  # HARD absolute ceiling on $-at-risk per order (early-live
+                           # backstop; null = fractions only). Raise as P&L is proven.
+
+# Model-failure kill-switch: halt trading if realized calibration (Brier score of
+# acted-on probabilities vs settled outcomes) drifts badly. Tripping is a latch —
+# clear it with `run_live.py --reset-guard` after you've diagnosed the model.
+guard:
+  enabled: true
+  min_samples: 20          # settled trades required before it can trip
+  max_brier: 0.25          # absolute ceiling (>0.25 = worse than a coin) backstop
+  # baseline_brier is the BINARY Brier of the acted-on P(YES) vs outcome
+  # (mean((p_yes - outcome)^2)), 0.25 = coin. This is NOT the backtest leaderboard's
+  # multi-bucket Brier — different metric, different scale. Set a tight arming value
+  # and refine it from forward acted-on settlements (run_paper score) once you have a
+  # few dozen. 0.15 + 0.05 tolerance trips at 0.20 (model drifting toward a coin).
+  baseline_brier: 0.15
+  tolerance: 0.05          # allowed drift above baseline_brier (threshold = sum)
+  window_days: 14          # how far back to read settled decisions
+  flatten_on_trip: false   # also sell out of open positions when tripped

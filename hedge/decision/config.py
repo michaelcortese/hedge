@@ -21,6 +21,16 @@ class RiskConfig:
     portfolio_cap: float = 0.30     # max total bankroll fraction at risk
     rebalance_band: float = 0.25    # only rebalance if target drifts > this frac
 
+    # Hard absolute ceiling on dollars-at-risk per order (None = no absolute cap,
+    # fractions still apply). A backstop for early live trading so a mis-read
+    # bankroll can't size large — caps in dollars, not just bankroll fraction.
+    max_order_dollars: float | None = None
+
+    # Hard stop on realized losses within a single UTC day (None = no daily stop).
+    # When the day's realized P&L drops below -daily_loss_stop_dollars the runner
+    # latches a halt for the rest of the UTC day. Backstop against a bad run.
+    daily_loss_stop_dollars: float | None = None
+
     # Extra model/structural uncertainty added in quadrature to the signal's
     # sampling std error. 0 = trust the signal's own sigma.
     sigma_model: float = 0.0
