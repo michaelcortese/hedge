@@ -56,36 +56,51 @@ class Decision:
     kelly_frac: float    # fractional-Kelly bankroll share
 
 
+def _tradeable(price: float | None) -> bool:
+    """A quote is fillable only if it sits strictly inside (0, 1) dollars.
+
+    A YES ask of 0.00/1.00 (or a NO ask implied by a yes_bid of 0.00/1.00) is the
+    API's way of saying "no resting size on that side" — NOT a free or certain fill.
+    Taking those literally is how a one-sided/locked book becomes a phantom edge that
+    Kelly bets into. Demo books are routinely one-sided; prod has locked markets too.
+    """
+    return price is not None and 0.0 < price < 1.0
+
+
 def decide(prob: float, sigma: float, yes_bid: float, yes_ask: float,
           risk: RiskParams) -> Decision:
     """Pick a side and size it, or abstain. Mirrors the framework's sizing rules.
 
     Buys cross the spread (YES at ask, NO at ``1 - yes_bid``); edge is net of the
-    taker fee. Trades only when the edge clears both ``tau_min_cents`` and
-    ``k_sigma * sigma`` (the noise gate that keeps Kelly safe).
+    taker fee. A side is only considered when its quote is genuinely tradeable
+    (strictly inside the dollar band) — a missing/degenerate quote is not a fill.
+    Trades only when the edge clears both ``tau_min_cents`` and ``k_sigma * sigma``
+    (the noise gate that keeps Kelly safe).
     """
-    # YES side: buy at ask.
-    yes_fee = taker_fee(yes_ask, risk.fee_coeff)
-    yes_edge = (prob - yes_ask) - yes_fee
-    # NO side: buy at (1 - yes_bid); NO wins with prob (1 - prob).
-    no_price = 1 - yes_bid
-    no_fee = taker_fee(no_price, risk.fee_coeff)
-    no_edge = ((1 - prob) - no_price) - no_fee
-
     tau = risk.tau_min_cents / 100.0
     gate = risk.k_sigma * sigma
 
-    best = max(yes_edge, no_edge)
-    if best <= 0 or best < tau or (prob - yes_ask if yes_edge >= no_edge else (1 - prob) - no_price) < gate:
-        return Decision("none", 0.0, best, 0.0)
+    # Each candidate: (side, exec_price, win_prob, net_edge_after_fee, raw_edge).
+    candidates: list[tuple[str, float, float, float, float]] = []
+    if _tradeable(yes_ask):  # YES side: buy at the ask.
+        candidates.append(("yes", yes_ask, prob,
+                           (prob - yes_ask) - taker_fee(yes_ask, risk.fee_coeff),
+                           prob - yes_ask))
+    if _tradeable(yes_bid):  # NO side: buy at (1 - yes_bid), which is then in (0, 1).
+        no_price = 1 - yes_bid
+        candidates.append(("no", no_price, 1 - prob,
+                           ((1 - prob) - no_price) - taker_fee(no_price, risk.fee_coeff),
+                           (1 - prob) - no_price))
 
-    if yes_edge >= no_edge:
-        price, win_prob = yes_ask, prob
-    else:
-        price, win_prob = no_price, 1 - prob
+    if not candidates:
+        return Decision("none", 0.0, 0.0, 0.0)  # no tradeable side — no market to beat
+
+    side, price, win_prob, net_edge, raw_edge = max(candidates, key=lambda c: c[3])
+    if net_edge <= 0 or net_edge < tau or raw_edge < gate:
+        return Decision("none", price, net_edge, 0.0)
     # Fractional Kelly on a binary contract: f* = edge / (1 - price).
     kelly = max(0.0, (win_prob - price) / (1 - price)) * risk.lambda_kelly
-    return Decision("yes" if yes_edge >= no_edge else "no", price, best, kelly)
+    return Decision(side, price, net_edge, kelly)
 
 
 def realized_pnl(decision: Decision, outcome_yes: bool, risk: RiskParams) -> float:

@@ -44,6 +44,22 @@ def test_noise_gate_blocks_uncertain_edge():
     assert d.side == "none"
 
 
+def test_abstains_on_degenerate_one_sided_book():
+    # No real ask (yes_ask = 1.00) and only a tiny yes bid: the YES side is not
+    # fillable, so a confident YES belief must NOT become a phantom "buy at 0" edge.
+    d = decide(0.80, sigma=0.01, yes_bid=0.0, yes_ask=1.0, risk=RISK)
+    assert d.side == "none"
+    # yes_ask = 0.00 likewise means "no ask", not a free YES contract.
+    d2 = decide(0.80, sigma=0.01, yes_bid=0.0, yes_ask=0.0, risk=RISK)
+    assert d2.side == "none"
+
+
+def test_no_side_still_taken_against_a_real_bid():
+    # A genuine yes_bid (0.60) makes the NO side fillable at 0.40; prob 0.20 -> buy NO.
+    d = decide(0.20, sigma=0.01, yes_bid=0.60, yes_ask=1.0, risk=RISK)
+    assert d.side == "no" and d.edge > 0
+
+
 def test_realized_pnl_signs():
     d = decide(0.70, sigma=0.02, yes_bid=0.53, yes_ask=0.55, risk=RISK)
     win = realized_pnl(d, outcome_yes=True, risk=RISK)
