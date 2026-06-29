@@ -21,14 +21,12 @@ COPY deploy/config.yaml /app/config.yaml
 # Durable state (SQLite, status.json, materialized PEM) lives on the mounted volume.
 VOLUME ["/data"]
 
-# Worker loop. KALSHI_ENV (demo|prod) is the real demo/prod switch; --allow-prod
-# only PERMITS prod, the env var GATES it (defaults to demo in fly.toml). Caps in
-# config.yaml (λ, $25/order, $50/day, validated cities) bound real-money risk.
+# Worker. KALSHI_ENV (demo|prod) is the real demo/prod switch; caps in config.yaml
+# (λ, $25/order, $50/day, validated cities) bound real-money risk when armed.
 #
-# PAUSED (real money): `--live` is intentionally REMOVED. The loop still reconciles
-# orders, backfills fills, and books settlement P&L on existing positions — but
-# places NO new orders (dry-run) — while we prove the strategy's edge on realized,
-# market-priced P&L. Re-arm by restoring `--live` (and only after the position-
-# management blockers are fixed and the edge clears the bar). --allow-prod is kept
-# so re-arming is a one-token change.
-CMD ["python", "-m", "hedge.runner", "--interval", "1800", "--allow-prod"]
+# PAUSED (real money): the entrypoint runs a dry-run reconciler (settles/books the
+# positions we already hold, places NO new orders) alongside the paper tournament
+# loop (logs signals + live prod quotes to /data for edge evidence — never trades).
+# Both persist to the durable volume. Re-arm real trading by restoring the single
+# live CMD:  CMD ["python","-m","hedge.runner","--live","--interval","1800","--allow-prod"]
+CMD ["sh", "scripts/fly_entrypoint.sh"]

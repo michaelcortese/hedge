@@ -22,13 +22,18 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 
-PAPER_DIR = Path("data/runs/paper")
+# Where paper signal logs live. On Fly, HEDGE_STATE_DIR=/data (the durable volume),
+# so logs survive restarts/redeploys; locally it falls back to the repo path. This
+# is what lets the forward edge-evidence track accumulate across deploys.
+_STATE_DIR = os.environ.get("HEDGE_STATE_DIR")
+PAPER_DIR = Path(_STATE_DIR) / "paper" if _STATE_DIR else Path("data/runs/paper")
 
 
 # --------------------------------------------------------------------------- #
