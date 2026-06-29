@@ -30,6 +30,8 @@ risk:
   market_cap_frac: 0.03    # max bankroll fraction per market
   portfolio_cap: 0.30      # max total at-risk fraction
   rebalance_band: 0.25     # only rebalance if target drifts > this fraction
+  min_price: 0.10          # refuse to open below this price (tail bets, no exit liquidity)
+  max_price: 0.90          # rich-side mirror of min_price
   max_order_dollars: 25.0  # HARD absolute ceiling on $-at-risk per order (early-live
                            # backstop; null = fractions only). Raise as P&L is proven.
 
