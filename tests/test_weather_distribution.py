@@ -86,3 +86,37 @@ def test_clamp_prob_bounds():
     assert 0 < clamp_prob(0.0, 1000) < 1
     assert 0 < clamp_prob(1.0, 1000) < 1
     assert clamp_prob(0.5, 1000) == 0.5
+
+
+def test_bias_correction_shifts_center_down():
+    # residual = predicted - realized; a +2F bias means the forecast runs warm, so the
+    # bias-corrected predictive mean must sit ~2F BELOW the raw forecast mean.
+    highs = [70.0, 72.0, 71.0]  # mean 71
+    plain = build_distribution(highs, model_sigma=2.0, n_draws=100_000, seed=1)
+    corrected = build_distribution(highs, model_sigma=2.0, n_draws=100_000, seed=1, bias=2.0)
+    assert abs(plain.mean() - 71.0) < 0.1
+    assert abs(corrected.mean() - 69.0) < 0.2
+
+
+def test_residual_skew_orientation():
+    # Right-skewed residuals (predicted - realized) mean the forecast occasionally
+    # lands far ABOVE the realized high, so realized draws must be LEFT-skewed.
+    # The pre-fix code added residuals (wrong sign) and would skew right.
+    res = np.concatenate([np.zeros(180), np.full(20, 8.0)])
+    dist = build_distribution([71.0, 72.0, 70.0], model_sigma=3.0,
+                              n_draws=100_000, seed=2, residuals=res)
+    # mean below median => left skew
+    assert dist.mean() < float(np.median(dist.draws))
+
+
+def test_excess_dispersion_not_double_counted():
+    # When today's model spread equals the calibration-window average, no extra
+    # spread should be added on top of model_sigma (the average is already inside it).
+    highs = [78.0, 80.0, 82.0]  # std ~2.0
+    disp = float(np.std(highs, ddof=1))
+    naive = build_distribution(highs, model_sigma=3.0, n_draws=50_000, seed=3)
+    deduped = build_distribution(highs, model_sigma=3.0, n_draws=50_000, seed=3,
+                                 mean_dispersion=disp)
+    # deduped keeps the narrower (correct) spread; naive double-counts dispersion.
+    assert deduped.sigma < naive.sigma
+    assert abs(deduped.sigma - 3.0) < 1e-9

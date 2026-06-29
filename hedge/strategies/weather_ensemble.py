@@ -59,6 +59,8 @@ class WeatherEnsembleStrategy(Strategy):
         lead = (tm.local_date - today).days
         sigma = self.calibration.sigma_for(tm.series, lead)
         residuals = self.calibration.residuals_for(tm.series, lead)
+        bias = self.calibration.bias_for(tm.series, lead)
+        mean_disp = self.calibration.dispersion_for(tm.series, lead)
 
         p, se = bucket_prob_and_se(
             highs, tm,
@@ -66,6 +68,8 @@ class WeatherEnsembleStrategy(Strategy):
             n_draws=self.n_draws,
             seed=_seed_from(tm),
             residuals=residuals,
+            bias=bias,
+            mean_dispersion=mean_disp,
         )
         return Signal(
             ticker=tm.ticker,

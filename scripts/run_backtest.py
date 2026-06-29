@@ -42,8 +42,12 @@ def main() -> None:
     ap.add_argument("--lead", type=int, default=1, help="forecast lead time in days")
     ap.add_argument("--cities", type=str, default="", help="comma list of series suffixes, e.g. NY,CHI")
     ap.add_argument("--lag", type=int, default=7, help="skip the most recent N days (ERA5 latency)")
-    ap.add_argument("--nowcast-hour", type=int, default=15, help="local hour the nowcast/blend evaluate at")
+    ap.add_argument("--asof-hours", type=str, default="9,15",
+                    help="comma list of local hours the nowcast/blend evaluate at. "
+                         "Include a pre-noon hour (< 12) so the blend exercises its "
+                         "ensemble fallback instead of always mirroring the nowcast.")
     args = ap.parse_args()
+    asof_hours = [int(h) for h in str(args.asof_hours).split(",") if h.strip() != ""]
 
     stations = list(STATIONS.values())
     if args.cities:
@@ -78,21 +82,34 @@ def main() -> None:
     def strategy_factory(station, target_day, as_of):
         fc = preloaded[station.series]
         archive_src = ArchiveForecastSource(preloaded=fc)
-        intraday_src = HistoricalIntradaySource(fc, hourly[station.series], args.nowcast_hour)
-        now = datetime(
-            target_day.year, target_day.month, target_day.day,
-            args.nowcast_hour, tzinfo=ZoneInfo(station.tz),
-        )
-        return [
+        # All-day forecast strategies are evaluated once per day.
+        strats = [
             WeatherEnsembleStrategy(source=archive_src, calibration=calib, as_of=as_of),
-            WeatherNowcastStrategy(source=intraday_src, calibration=calib, now=now),
-            WeatherBlendStrategy(source=intraday_src, calibration=calib, as_of=as_of, now=now),
             WeatherClimatologyStrategy(years=20, window_days=7),
         ]
+        # Intraday strategies are swept across as-of hours: before noon the nowcast
+        # abstains and the blend falls back to the ensemble (so blend != nowcast);
+        # in the afternoon the nowcast acts and the blend defers to it.
+        for hour in asof_hours:
+            intraday_src = HistoricalIntradaySource(fc, hourly[station.series], hour)
+            now = datetime(
+                target_day.year, target_day.month, target_day.day,
+                hour, tzinfo=ZoneInfo(station.tz),
+            )
+            strats.append(WeatherNowcastStrategy(source=intraday_src, calibration=calib, now=now))
+            strats.append(WeatherBlendStrategy(
+                source=intraday_src, calibration=calib, as_of=as_of, now=now))
+        return strats
+
+    def grid_center(station, target_day, as_of):
+        """Decision-time grid center: the as-of model forecast mean (no lookahead)."""
+        fc = preloaded[station.series].get(target_day.isoformat())
+        return float(sum(fc) / len(fc)) if fc else None
 
     print("grading strategies over test window ...")
     records = run_backtest(
         stations, test_start, test_end, strategy_factory, lead_days=args.lead,
+        grid_center_fn=grid_center,
     )
     if not records:
         print("no graded days — check archive availability for this window.")

@@ -96,9 +96,18 @@ def grade_day(
     *,
     half_width: int = 18,
     bucket_width: int = 1,
+    center: float | None = None,
 ) -> GradedDay | None:
-    """Run one strategy over one day's bucket grid and grade it. None = abstained."""
-    grid = build_grid(realized, half_width=half_width, bucket_width=bucket_width)
+    """Run one strategy over one day's bucket grid and grade it. None = abstained.
+
+    ``center`` is the value the bucket grid is built around. It MUST be a quantity
+    known at decision time (e.g. the as-of forecast mean) — centering on ``realized``
+    leaks the outcome into the grid, flattering every strategy. The grid carries
+    unbounded tails, so the realized high still lands in some bucket (a real
+    forecast miss now correctly lands in a tail instead of always near center).
+    """
+    grid = build_grid(realized if center is None else center,
+                      half_width=half_width, bucket_width=bucket_width)
     widx = _winning_index(grid, realized)
     if widx < 0:
         return None  # grid didn't cover the realized high (shouldn't happen)
@@ -145,6 +154,7 @@ def run_backtest(
     lead_days: int = 1,
     half_width: int = 18,
     bucket_width: int = 1,
+    grid_center_fn=None,
 ) -> list[GradedDay]:
     """Grade every strategy over every covered (station, day).
 
@@ -152,6 +162,12 @@ def run_backtest(
     ``Strategy`` instances to run for that (station, day), wired to an archive
     source and the right ``as_of`` so lead time is honest. The target day is passed
     so intraday strategies (nowcast/blend) can build their time-of-day context.
+
+    ``grid_center_fn(station, target_day, as_of) -> float | None`` supplies the
+    decision-time center for the bucket grid (e.g. the as-of forecast mean) so the
+    grid does NOT leak the realized outcome. Returns None to fall back to a forecast
+    being unavailable; the grid then centers on realized (legacy behaviour). The same
+    center is used for every strategy that day, keeping the comparison fair.
     Returns the flat list of ``GradedDay`` records.
     """
     results: list[GradedDay] = []
@@ -163,10 +179,12 @@ def run_backtest(
             if realized is None:
                 continue
             as_of = day - timedelta(days=lead_days)
+            center = grid_center_fn(st, day, as_of) if grid_center_fn else None
             for strat in strategy_factory(st, day, as_of):
                 graded = grade_day(
                     strat, st, day, realized,
                     half_width=half_width, bucket_width=bucket_width,
+                    center=center,
                 )
                 if graded is not None:
                     results.append(graded)
