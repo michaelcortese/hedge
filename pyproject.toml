@@ -1,0 +1,26 @@
+[project]
+name = "hedge"
+version = "0.1.0"
+description = "Kalshi trading bot: Monte Carlo signals -> edge/Kelly sizing -> Kalshi orders"
+requires-python = ">=3.11"
+dependencies = [
+    "cryptography>=42.0",
+    "requests>=2.31",
+    "PyYAML>=6.0",
+    "websocket-client>=1.7",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+# Optional computer-vision deps for the deprioritized camera-OCR research probe.
+camera = ["pytesseract>=0.3", "opencv-python>=4.9"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["hedge*"]

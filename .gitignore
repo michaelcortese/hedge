@@ -1,0 +1,19 @@
+# Secrets — never commit
+config.yaml
+secrets/
+*.pem
+*.key
+
+# Cached weather/market fetches and tournament outputs
+data/cache/
+data/runs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/

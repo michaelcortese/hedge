@@ -1,0 +1,32 @@
+# Copy to config.yaml and fill in. config.yaml is gitignored.
+kalshi:
+  # Which environment the bot uses. "demo" for paper trading / development;
+  # "prod" for real money. Demo and prod keys are SEPARATE and not
+  # interchangeable, so each environment has its own credentials below.
+  env: demo
+
+  environments:
+    demo:
+      base_url: https://demo-api.kalshi.co/trade-api/v2
+      # API Key ID (UUID) from the Kalshi DEMO web UI.
+      key_id: "REPLACE_DEMO_KEY_ID"
+      # PEM that demo showed you once at key creation.
+      private_key_path: secrets/kalshi_demo_private_key.pem
+    prod:
+      base_url: https://api.elections.kalshi.com/trade-api/v2
+      # API Key ID (UUID) from the Kalshi PROD web UI.
+      key_id: "REPLACE_PROD_KEY_ID"
+      private_key_path: secrets/kalshi_prod_private_key.pem
+
+  # Env vars override the active environment's values if set:
+  #   KALSHI_KEY_ID, KALSHI_PRIVATE_KEY_PATH, KALSHI_BASE_URL
+
+# Risk / sizing knobs (consumed by the decision engine, not yet wired).
+risk:
+  lambda_kelly: 0.25       # fraction of full Kelly (0.25-0.5 recommended)
+  k_sigma: 2.0             # require |p - q| > k_sigma * sigma to trade
+  z_ci: 1.0               # conservative-edge CI haircut on prob
+  tau_min_cents: 2         # minimum net edge in cents to act
+  market_cap_frac: 0.03    # max bankroll fraction per market
+  portfolio_cap: 0.30      # max total at-risk fraction
+  rebalance_band: 0.25     # only rebalance if target drifts > this fraction
