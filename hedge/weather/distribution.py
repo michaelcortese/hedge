@@ -71,13 +71,16 @@ def build_distribution(
     seed: int | None = None,
     residuals: np.ndarray | None = None,
     floor_high: float | None = None,
+    bias: float = 0.0,
+    mean_dispersion: float | None = None,
 ) -> HighTempDistribution:
     """Build a predictive distribution of the rounded daily high.
 
     Args:
         point_highs: one forecast of the daily high per model/source.
-        model_sigma: calibrated forecast-error std (°F). Combined in quadrature
-            with inter-model dispersion to set the total spread.
+        model_sigma: calibrated forecast-error std (°F). Already the std of the
+            *ensemble-mean* error over the fit window, so it embeds the average
+            inter-model spread; only the *excess* same-day dispersion is added.
         n_draws: Monte Carlo sample size (sets sampling std error downstream).
         seed: RNG seed for reproducibility (strategies seed from market+date).
         residuals: optional empirical forecast-error sample (°F) to draw the shape
@@ -85,20 +88,36 @@ def build_distribution(
         floor_high: optional hard lower bound on the final high (the nowcast's
             observed max-so-far). Draws below it are lifted to it: the day's max
             cannot end up below what's already been observed.
+        bias: calibrated systematic forecast error ``mean(predicted - realized)``
+            (°F). The forecast center is shifted *down* by this so the predictive
+            distribution is centered on the bias-corrected high, not the raw forecast.
+        mean_dispersion: average inter-model spread (°F) over the fit window. When
+            given, only the excess of today's dispersion over this average is added
+            in quadrature to ``model_sigma`` (avoids double-counting the typical
+            disagreement already inside ``model_sigma``). None → add full dispersion.
     """
     if not point_highs:
         raise ValueError("need at least one point forecast")
     rng = np.random.default_rng(seed)
     arr = np.asarray(point_highs, dtype=float)
-    center = float(arr.mean())
+    # Correct the forecast for its known systematic bias (predicted - realized).
+    center = float(arr.mean()) - bias
     dispersion = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
-    sigma = float(np.hypot(model_sigma, dispersion))
+    if mean_dispersion is not None:
+        # Only today's *excess* disagreement; the average is already in model_sigma.
+        extra_var = max(0.0, dispersion**2 - mean_dispersion**2)
+    else:
+        extra_var = dispersion**2
+    sigma = float(np.sqrt(model_sigma**2 + extra_var))
 
     if residuals is not None and residuals.size >= 30:
-        # Resample empirical residuals, scaled so their std matches `sigma`.
+        # Resample empirical residuals (predicted - realized), zero-centered and
+        # scaled so their std matches `sigma`. Because residual = predicted - realized,
+        # a realized draw is center - residual: SUBTRACT, so the skew lands the right
+        # way round (the bias term above already carries the residual mean).
         res = np.asarray(residuals, dtype=float)
         res = (res - res.mean()) / (res.std(ddof=1) or 1.0) * sigma
-        samples = center + rng.choice(res, size=n_draws, replace=True)
+        samples = center - rng.choice(res, size=n_draws, replace=True)
     else:
         samples = rng.normal(center, sigma, size=n_draws)
 
@@ -109,14 +128,23 @@ def build_distribution(
     return HighTempDistribution(draws=draws, center=center, sigma=sigma)
 
 
+#: Share of the calibrated model error that is *shared* across ensemble members
+#: (common NWP/initial-condition bias). This part does NOT shrink by averaging more
+#: correlated members, so it floors SE(center) independent of ``n``. The rest of
+#: ``model_sigma`` is aleatoric weather spread already injected separately, so using
+#: the full ``model_sigma`` here would double-count and effectively halt trading.
+_IRREDUCIBLE_CENTER_FRAC = 0.4
+
+
 def _center_se(point_highs: list[float], model_sigma: float) -> float:
-    """Std error of the blended center: combines spread-of-the-mean across models
-    with the irreducible model error. With few members this is crude but honest."""
+    """Std error of the blended center: the spread-of-the-mean across models (which
+    shrinks as 1/sqrt(n)) combined with an n-independent irreducible-bias floor. A
+    falsely-agreeing ensemble cannot claim near-zero center error."""
     arr = np.asarray(point_highs, dtype=float)
     n = max(arr.size, 1)
     ens_se = (arr.std(ddof=1) / np.sqrt(n)) if arr.size > 1 else model_sigma
-    # Don't let a falsely-agreeing ensemble claim near-zero center error.
-    return float(max(ens_se, model_sigma / np.sqrt(n)))
+    irreducible = _IRREDUCIBLE_CENTER_FRAC * model_sigma
+    return float(np.hypot(ens_se, irreducible))
 
 
 def bucket_prob_and_se(
@@ -128,16 +156,20 @@ def bucket_prob_and_se(
     seed: int | None = None,
     residuals: np.ndarray | None = None,
     floor_high: float | None = None,
+    bias: float = 0.0,
+    mean_dispersion: float | None = None,
 ) -> tuple[float, float]:
     """Return ``(p, std_error)`` for a market's YES, folding both uncertainty terms.
 
     ``p`` is clamped into the open interval ``(0, 1)`` the Signal contract requires;
     a bucket that no draw hit is reported as ``~1/(2*n_draws)``, not 0 — an honest
-    "very unlikely, not impossible".
+    "very unlikely, not impossible". ``bias``/``mean_dispersion`` are passed straight
+    through to :func:`build_distribution` (see there).
     """
     dist = build_distribution(
         point_highs, model_sigma=model_sigma, n_draws=n_draws,
         seed=seed, residuals=residuals, floor_high=floor_high,
+        bias=bias, mean_dispersion=mean_dispersion,
     )
     p = dist.prob_for_market(market)
 
@@ -148,11 +180,11 @@ def bucket_prob_and_se(
     se_center = _center_se(point_highs, model_sigma)
     shifted = [h + se_center for h in point_highs], [h - se_center for h in point_highs]
     p_hi = build_distribution(shifted[0], model_sigma=model_sigma, n_draws=n_draws,
-                              seed=seed, residuals=residuals,
-                              floor_high=floor_high).prob_for_market(market)
+                              seed=seed, residuals=residuals, floor_high=floor_high,
+                              bias=bias, mean_dispersion=mean_dispersion).prob_for_market(market)
     p_lo = build_distribution(shifted[1], model_sigma=model_sigma, n_draws=n_draws,
-                              seed=seed, residuals=residuals,
-                              floor_high=floor_high).prob_for_market(market)
+                              seed=seed, residuals=residuals, floor_high=floor_high,
+                              bias=bias, mean_dispersion=mean_dispersion).prob_for_market(market)
     param_se = abs(p_hi - p_lo) / 2.0
 
     se = float(np.hypot(sampling_se, param_se))

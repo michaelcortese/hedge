@@ -77,6 +77,8 @@ class WeatherNowcastStrategy(Strategy):
         hours_left = max(0, 20 - now.hour)  # ~8pm typical peak-cooling reference
         sigma = sigma * min(1.0, 0.35 + 0.065 * hours_left)
         residuals = self.calibration.residuals_for(tm.series, lead)
+        bias = self.calibration.bias_for(tm.series, lead)
+        mean_disp = self.calibration.dispersion_for(tm.series, lead)
 
         p, se = bucket_prob_and_se(
             highs, tm,
@@ -85,6 +87,8 @@ class WeatherNowcastStrategy(Strategy):
             seed=abs(hash((tm.ticker, now.hour))) % (2**31),
             residuals=residuals,
             floor_high=obs_max,
+            bias=bias,
+            mean_dispersion=mean_disp,
         )
         return Signal(
             ticker=tm.ticker,

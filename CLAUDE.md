@@ -154,14 +154,58 @@ hedge/
   kalshi/
     auth.py              # RSA-PSS request signing (don't touch unless fixing auth)
     client.py            # REST client: markets, orderbook, orders, positions
-  decision/              # (WIP) edge calc + Kelly sizing + risk caps
-  execution/             # (WIP) decision -> signed order
-  runner.py              # (WIP) main loop: signals -> decide -> execute
+  decision/              # edge calc + Kelly sizing + risk caps
+    engine.py            # decide(): Signal + quote -> Decision (the pipeline)
+  execution/             # decision -> signed order
+    executor.py          # build order body, idempotency, dry-run/prod guards
+  guard.py               # calibration kill-switch: halt if realized Brier drifts
+  state.py               # durable SQLite state (orders, daily P&L, cycle seq) — crash-safe
+  alerts.py              # push notifications (ntfy/Pushover/Slack), best-effort
+  runner.py              # main loop: signals -> decide -> execute (dry-run default)
 config.example.yaml      # copy to config.yaml (gitignored) and fill in
 scripts/test_auth.py     # auth smoke test (offline + optional live)
 scripts/run_backtest.py  # historical tournament -> leaderboard (no creds needed)
-scripts/run_paper.py     # forward paper tournament vs Kalshi demo (snapshot/score)
+scripts/run_paper.py     # paper tournament: snapshot/loop/score/edge (+ --prod read-only)
+scripts/run_live.py      # the trading loop (dry-run by default; --live to arm)
+scripts/validate_stations.py  # validate settlement stations vs resolved markets
+Dockerfile / fly.toml    # container + Fly.io worker config (24/7 deploy)
+.dockerignore            # keeps secrets/state out of the image
+deploy/config.yaml       # secrets-free risk/guard caps baked into the image
+docs/DEPLOYMENT_PLAN.md  # phased 24/7 autonomous-deploy plan (cited)
+docs/RUNBOOK.md          # exact fly deploy + operations commands
 ```
+
+## Running the bot (steady-state)
+
+Three escalating modes, safest first:
+
+```bash
+# 1. Continuous PAPER loop — log signals+prices all day, score after settlement.
+.venv/bin/python scripts/run_paper.py loop --interval 900 --until 19:00
+.venv/bin/python scripts/run_paper.py score
+
+# 2. DRY-RUN the real engine — decide + report orders, place nothing (default).
+.venv/bin/python scripts/run_live.py --once
+.venv/bin/python scripts/run_live.py --interval 900 --until 19:00
+
+# 3. ARM real orders (demo). Never prod without --allow-prod.
+.venv/bin/python scripts/run_live.py --live --interval 900 --until 19:00
+```
+
+The runner reads `risk:` from `config.yaml` into a `RiskConfig`, pulls bankroll
+from the Kalshi balance (override with `--bankroll`), and per market picks the
+single best-edge decision across all strategies (they share one order book).
+Orders are dry-run and demo-only unless you explicitly arm them. **Don't `--live`
+a strategy that hasn't cleared the calibration bar in the backtest.**
+
+**Calibration kill-switch (`guard.py`, `guard:` config).** Kelly survives variance
+but not *bias* — a systematically wrong `p` bleeds money. Each cycle the runner
+scores the realized Brier of acted-on probabilities against settled outcomes; if it
+exceeds `max_brier` (or `baseline_brier + tolerance`) over at least `min_samples`
+settled trades, it **halts and latches** — no new orders, optionally flattens
+positions (`flatten_on_trip`). The latch persists (a `data/runs/live/HALTED` file)
+until you investigate and clear it: `run_live.py --reset-guard`. Disable entirely
+(not recommended) with `--no-guard`.
 
 ## Weather hedge (daily-high temperature markets)
 
@@ -221,9 +265,17 @@ Develop and backtest against **demo** before pointing at prod.
   `yes_price + no_price = 100`. There is **no shorting** — bet against an outcome
   by **buying NO**; `action="sell"` only closes an existing position.
 - **Order book** returns bids only on both sides; reconstruct `yes_ask = 100 - best_no_bid`.
-- **Order body:** `ticker, action(buy|sell), side(yes|no), type(limit|market),
-  count, yes_price|no_price (cents), client_order_id`. Always send a
-  `client_order_id` (UUID) for idempotency.
+- **Orders are V2** (verified live 2026-06): create/cancel moved to
+  `POST /portfolio/events/orders` and `DELETE /portfolio/events/orders/{id}` (the V1
+  `/portfolio/orders` create/cancel return **HTTP 410 deprecated**). READS stay on
+  `/portfolio/orders` (list) and `/portfolio/orders/{id}` (single — but it's
+  eventually-consistent and 404s on a just-placed order, so reconcile via the LIST).
+  V2 body is YES-priced and side-only: `ticker, side(bid=buy YES | ask=sell YES=buy
+  NO), count("N.00"), price("0.NNNN" dollars, always the YES price), time_in_force
+  (immediate_or_cancel | good_till_canceled), self_trade_prevention_type, client_order_id,
+  post_only`. There is **no** action/yes_price/no_price/type. To buy NO: `side="ask"`
+  at `price = 1 - no_price`. Always send `client_order_id` (UUID) for idempotency.
+  Built by `hedge/execution/executor.py:build_order_body`.
 - **Fees:** taker ≈ `ceil(0.07 · C · P · (1-P))` cents, max ~1.75¢/contract at 50¢;
   maker usually free. Coefficient is **not** universally 0.07 — pull the official
   Fee Schedule PDF and key it per market for production edge math. Settlement is

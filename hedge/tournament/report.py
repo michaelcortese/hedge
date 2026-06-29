@@ -58,9 +58,7 @@ def crps(grid: list[Bucket], probs: list[float], realized: float) -> float:
     p = np.asarray(probs, dtype=float)
     cdf = np.cumsum(p)
     pts_arr = np.asarray(pts, dtype=float)
-    indicator = (pts_arr >= round(realized)).astype(float)
-    obs_cdf = np.cumsum(indicator) / max(indicator.sum(), 1)
-    # Simpler, standard discrete CRPS: sum over thresholds of (F(t)-1{obs<=t})^2.
+    # Standard discrete CRPS: sum over thresholds of (F(t) - 1{obs <= t})^2.
     step = (pts_arr >= round(realized)).astype(float)
     return float(np.sum((cdf - step) ** 2))
 
@@ -102,8 +100,29 @@ def calibration_error(records: list[GradedDay], n_bins: int = 10) -> dict[str, f
     return out
 
 
+def _matched_skill(df: pd.DataFrame, baseline: str, metric: str) -> pd.Series:
+    """Skill vs baseline on the *intersection* of (city, date) both predicted.
+
+    Strategies abstain on different days, so comparing each strategy's full-sample
+    mean against the baseline's full-sample mean mixes different day sets — a
+    strategy that only acts on easy days looks artificially skilful. We instead
+    join each strategy to the baseline on (city, date) and take the ratio of means
+    over the common days only. Ratio form (not difference) so the λ thresholds in
+    ``_lambda_tier`` keep their meaning.
+    """
+    base = (df[df["strategy"] == baseline][["city", "date", metric]]
+            .rename(columns={metric: "_base"}))
+    if base.empty:
+        return pd.Series(dtype=float)
+    merged = df.merge(base, on=["city", "date"], how="inner")
+    g = merged.groupby("strategy")
+    num = g[metric].mean()
+    den = g["_base"].mean()
+    return 1 - num / den.where(den != 0, np.nan)
+
+
 def leaderboard(records: list[GradedDay], *, baseline: str = "weather_climatology") -> pd.DataFrame:
-    """Aggregate per-strategy scores + skill vs the climatology baseline."""
+    """Aggregate per-strategy scores + matched-pairs skill vs the climatology baseline."""
     df = _per_day_scores(records)
     agg = df.groupby("strategy").agg(
         n_days=("brier", "size"),
@@ -116,14 +135,15 @@ def leaderboard(records: list[GradedDay], *, baseline: str = "weather_climatolog
     ece = calibration_error(records)
     agg["calib_err"] = agg["strategy"].map(ece)
 
-    base = agg.loc[agg["strategy"] == baseline]
-    if not base.empty:
-        b_brier = base["brier"].iloc[0]
-        b_ll = base["log_loss"].iloc[0]
-        b_crps = base["crps"].iloc[0]
-        agg["skill_brier"] = 1 - agg["brier"] / b_brier
-        agg["skill_log_loss"] = 1 - agg["log_loss"] / b_ll
-        agg["skill_crps"] = 1 - agg["crps"] / b_crps
+    if (df["strategy"] == baseline).any():
+        # Days the strategy and baseline both scored (fair, matched comparison).
+        base = df[df["strategy"] == baseline][["city", "date"]]
+        n_matched = (df.merge(base, on=["city", "date"], how="inner")
+                     .groupby("strategy").size())
+        agg["n_matched"] = agg["strategy"].map(n_matched).fillna(0).astype(int)
+        agg["skill_brier"] = agg["strategy"].map(_matched_skill(df, baseline, "brier"))
+        agg["skill_log_loss"] = agg["strategy"].map(_matched_skill(df, baseline, "log_loss"))
+        agg["skill_crps"] = agg["strategy"].map(_matched_skill(df, baseline, "crps"))
     return agg.sort_values("brier").reset_index(drop=True)
 
 

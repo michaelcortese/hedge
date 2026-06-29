@@ -40,12 +40,17 @@ class CalibrationTable:
 
     ``sigma`` maps ``(series, lead_days) -> std(°F)``. ``residuals`` optionally maps
     the same key to a sample of signed errors (predicted - realized) so the MC core
-    can draw a non-Gaussian shape. Both fall back to the prior when a key is missing
-    or under-sampled.
+    can draw a non-Gaussian shape. ``bias`` is the *mean* signed error per key (the
+    systematic warm/cold tendency the MC core must correct for); ``dispersion`` is the
+    average inter-model spread over the fit window, so the MC core can add only the
+    *excess* same-day disagreement instead of double-counting spread already baked
+    into ``sigma``. All fall back sensibly when a key is missing or under-sampled.
     """
 
     sigma: dict[tuple[str, int], float] = field(default_factory=dict)
     residuals: dict[tuple[str, int], np.ndarray] = field(default_factory=dict)
+    bias: dict[tuple[str, int], float] = field(default_factory=dict)
+    dispersion: dict[tuple[str, int], float] = field(default_factory=dict)
 
     def sigma_for(self, series: str, lead_days: int) -> float:
         return self.sigma.get((series.upper(), max(lead_days, 0)),
@@ -54,16 +59,26 @@ class CalibrationTable:
     def residuals_for(self, series: str, lead_days: int) -> np.ndarray | None:
         return self.residuals.get((series.upper(), max(lead_days, 0)))
 
+    def bias_for(self, series: str, lead_days: int) -> float:
+        """Mean signed error ``predicted - realized`` (°F), or 0.0 if unfit."""
+        return self.bias.get((series.upper(), max(lead_days, 0)), 0.0)
+
+    def dispersion_for(self, series: str, lead_days: int) -> float | None:
+        """Average inter-model spread (°F) over the fit window, or None if unfit."""
+        return self.dispersion.get((series.upper(), max(lead_days, 0)))
+
 
 def fit_calibration(stations, start, end, *, min_samples: int = 30) -> CalibrationTable:
     """Fit forecast-error spread per city from the historical-forecast archive.
 
     For each station we pool the signed errors ``ensemble_mean_forecast - realized``
-    over ``[start, end]`` and take their std as the calibrated level. We don't have
-    a clean per-lead split from the archive, so we anchor the fitted level at lead 1
-    and reshape across leads using the prior curve — calibrating the *magnitude* per
-    city while keeping the sensible lead-time growth. Cities with too little data
-    fall back to the prior entirely.
+    over ``[start, end]`` and take their std as the calibrated *spread* and their mean
+    as the systematic *bias*. We don't have a clean per-lead split from the archive, so
+    we anchor the fitted spread at lead 1 and reshape across leads using the prior
+    curve — calibrating the *magnitude* per city while keeping the sensible lead-time
+    growth. The bias is a physical offset of the forecast itself (a station that reads
+    warm reads warm at every lead), so it is stored lead-independent, not stretched by
+    the spread curve. Cities with too little data fall back to the prior entirely.
     """
     from hedge.weather.archive import (
         archive_daily_highs,
@@ -75,16 +90,23 @@ def fit_calibration(stations, start, end, *, min_samples: int = 30) -> Calibrati
         realized = archive_daily_highs(st, start, end)
         forecasts = historical_model_highs_range(st, start, end)
         residuals: list[float] = []
+        dispersions: list[float] = []
         for d_iso, fc in forecasts.items():
             obs = realized.get(d_iso)
             if obs is not None and fc:
                 residuals.append(float(np.mean(fc)) - obs)
+                if len(fc) > 1:
+                    dispersions.append(float(np.std(fc, ddof=1)))
         if len(residuals) < min_samples:
             continue
         res = np.asarray(residuals, dtype=float)
         sigma1 = float(res.std(ddof=1))
+        bias1 = float(res.mean())
+        mean_disp = float(np.mean(dispersions)) if dispersions else 0.0
         anchor = default_sigma(1)
         for lead in range(len(_PRIOR_SIGMA_BY_LEAD)):
             table.sigma[(st.series, lead)] = sigma1 * default_sigma(lead) / anchor
             table.residuals[(st.series, lead)] = res
+            table.bias[(st.series, lead)] = bias1
+            table.dispersion[(st.series, lead)] = mean_disp
     return table

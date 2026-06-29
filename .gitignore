@@ -1,5 +1,7 @@
 # Secrets — never commit
 config.yaml
+# ...but the secrets-FREE deploy config IS committed (baked into the image).
+!deploy/config.yaml
 secrets/
 *.pem
 *.key
