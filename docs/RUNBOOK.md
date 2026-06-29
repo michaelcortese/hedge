@@ -87,7 +87,14 @@ The image's `CMD` already includes `--allow-prod`; **`KALSHI_ENV` is the real sw
 ```bash
 fly logs                                              # live cycle output + decisions
 fly ssh console -C "cat /data/status.json"            # snapshot: bankroll, positions, halted
-fly ssh console -C "cat /data/hedge.db | sqlite3 :memory: ''"   # (or copy the db down)
+
+# The learning views — everything the bot believed/decided/did/realized (read-only):
+fly ssh console -C "python scripts/db_report.py decisions"          # today's decisions (incl. HOLDs)
+fly ssh console -C "python scripts/db_report.py trades"            # fills -> settlement -> realized P&L
+fly ssh console -C "python scripts/db_report.py calibration --by city"  # predicted vs realized P(YES)
+fly ssh console -C "python scripts/db_report.py pnl"               # realized P&L by day
+# Or copy the DB down and inspect locally:
+#   fly ssh sftp get /data/hedge.db ./hedge.db && python scripts/db_report.py --db ./hedge.db calibration
 
 # Clear a tripped kill-switch / daily-loss latch after diagnosing:
 fly ssh console -C "python -m hedge.runner --reset-guard"
