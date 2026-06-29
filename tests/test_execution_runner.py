@@ -90,13 +90,16 @@ class _FakeClient:
         m = {"ticker": ticker}
         if ticker in self.results:
             m["result"] = self.results[ticker]
+        # Optional per-ticker quote/strike fields so a held market pulled directly
+        # (not via discovery) still presents a two-sided book to manage against.
+        m.update(getattr(self, "market_fields", {}).get(ticker, {}))
         return {"market": m}
 
     def get_balance(self):
         return {"balance": 1_000_00}  # $1,000 in cents
 
     def get_positions(self):
-        return {"market_positions": []}
+        return {"market_positions": getattr(self, "positions_payload", [])}
 
 
 def test_dry_run_does_not_place():
@@ -343,6 +346,33 @@ def test_reconcile_fills_records_broker_fill(monkeypatch, tmp_path):
     assert abs(rows[0]["avg_price_cents"] - 55.0) < 1e-9
 
 
+def test_reconcile_fills_parses_live_kalshi_field_shape(monkeypatch, tmp_path):
+    # Contract test pinned to the REAL prod /portfolio/fills payload (captured live
+    # 2026-06-29): count is `count_fp` (a fixed-point STRING, can be fractional from
+    # pro-rata maker matching), prices are `{yes,no}_price_dollars` (STRING dollars),
+    # fee is `fee_cost` (STRING dollars), and `action`/`book_side` are YES-centric
+    # (buying NO is action="sell"/book_side="ask"). Reading the old cents names —
+    # the bug that left the fills table empty in prod and booked ZERO P&L — must fail
+    # this test. We bought 13 NO @ 28c as a maker (fee 0).
+    t = "KXHIGHAUS-26JUN29-B96.5"
+    client = _RunnerClient()
+    client.fills = [{
+        "order_id": "OID-LIVE", "ticker": t, "market_ticker": t,
+        "side": "no", "outcome_side": "no", "action": "sell", "book_side": "ask",
+        "count_fp": "13.00", "no_price_dollars": "0.2800", "yes_price_dollars": "0.7200",
+        "fee_cost": "0.000000", "is_taker": False,
+    }]
+    r = _runner(client, tmp_path, monkeypatch, t)
+    r.state.record_order("coid-live", t, "no", "buy", 28, 13, order_id="OID-LIVE",
+                         status="executed")
+    r.run_cycle()
+    rows = r.state.fills_for_ticker(t)
+    assert len(rows) == 1
+    assert rows[0]["fill_count"] == 13                       # parsed count_fp, not skipped
+    assert abs(rows[0]["avg_price_cents"] - 28.0) < 1e-9     # no_price_dollars -> cents
+    assert abs(rows[0]["fee_cents"] - 0.0) < 1e-9            # maker fill: real fee_cost = 0
+
+
 def test_cycle_persists_decision_rows(monkeypatch, tmp_path):
     # Every market decided in a cycle writes a queryable decisions row.
     t = "KXHIGHCHI-26JUN29-T80"
@@ -357,3 +387,111 @@ def test_cycle_persists_decision_rows(monkeypatch, tmp_path):
     assert d["ticker"] == t and d["action"] == "buy" and d["side"] == "yes"
     assert d["yes_bid"] == 0.53 and d["yes_ask"] == 0.55   # market snapshot captured
     assert d["prob"] is not None and d["client_order_id"]
+
+
+# --------------------------------------------------------------------------- #
+# Position management: read holdings correctly, re-evaluate + exit intraday     #
+# --------------------------------------------------------------------------- #
+def test_positions_reads_fixed_point_fields(monkeypatch, tmp_path):
+    # The live Kalshi payload reports holdings as `position_fp` (signed STRING) and
+    # cost basis as `market_exposure_dollars`. Reading the old `position`/
+    # `market_exposure` names returned an empty dict — the bug that left every
+    # position unmanaged because the engine was never handed a Position.
+    t = "KXHIGHCHI-26JUN29-T80"
+    client = _RunnerClient()
+    client.positions_payload = [
+        {"ticker": t, "position_fp": "-4.00", "market_exposure_dollars": "1.80"},
+        {"ticker": "KXHIGHMIA-26JUN29-B91.5", "position_fp": "458.00",
+         "market_exposure_dollars": "7.33"},
+    ]
+    r = _runner(client, tmp_path, monkeypatch, t)
+    pos = r.positions()
+    assert pos[t].side is Side.NO and pos[t].count == 4
+    assert abs(pos[t].avg_price - 0.45) < 1e-9            # 1.80 / 4
+    mia = pos["KXHIGHMIA-26JUN29-B91.5"]
+    assert mia.side is Side.YES and mia.count == 458
+
+
+def test_positions_falls_back_to_legacy_fields(monkeypatch, tmp_path):
+    # Older payloads: integer `position` (contracts) + `market_exposure` (cents).
+    t = "KXHIGHCHI-26JUN29-T80"
+    client = _RunnerClient()
+    client.positions_payload = [{"ticker": t, "position": -3, "market_exposure": 135}]
+    r = _runner(client, tmp_path, monkeypatch, t)
+    pos = r.positions()
+    assert pos[t].side is Side.NO and pos[t].count == 3
+    assert abs(pos[t].avg_price - 0.45) < 1e-9            # 135c / 3 = 45c
+
+
+_MANAGE = RiskConfig(manage_positions=True)   # intraday management enabled (gated OFF by default)
+
+
+def test_held_position_flips_to_exit_when_model_reverses(monkeypatch, tmp_path):
+    # Hold 4 NO; the bull model now wants YES with edge -> the engine SELLs the held
+    # NO to exit (intraday reversal management), not a blind hold to settlement.
+    t = "KXHIGHCHI-26JUN29-T80"
+    client = _RunnerClient()
+    client.positions_payload = [
+        {"ticker": t, "position_fp": "-4.00", "market_exposure_dollars": "1.80"}]
+    r = _runner(client, tmp_path, monkeypatch, t, cfg=_MANAGE)
+    tickets = r.run_cycle()
+    tk = next(x for x in tickets if x.decision.ticker == t)
+    assert tk.decision.action is Action.SELL and tk.decision.side is Side.NO
+    assert tk.decision.count == 4 and tk.placed is True
+    assert tk.decision.price_cents == 45            # exits at no_bid = 1 - yes_ask(.55)
+    assert len(client.orders) == 1
+
+
+def test_management_off_by_default_holds_position(monkeypatch, tmp_path):
+    # With the default RiskConfig (manage_positions=False) the SAME reversing position
+    # is NOT touched — the engine is never handed the position, so no exit is generated.
+    t = "KXHIGHCHI-26JUN29-T80"
+    client = _RunnerClient()
+    client.positions_payload = [
+        {"ticker": t, "position_fp": "-4.00", "market_exposure_dollars": "1.80"}]
+    r = _runner(client, tmp_path, monkeypatch, t)          # default cfg: management OFF
+    tickets = r.run_cycle()
+    tk = next(x for x in tickets if x.decision.ticker == t)
+    # Flat-treated -> the bull model just opens YES (or holds); it never SELLs the NO.
+    assert tk.decision.action is not Action.SELL
+
+
+def test_manages_held_ticker_absent_from_discovery(monkeypatch, tmp_path):
+    # Discovery returns nothing (market aged out / fresh redeploy), but we still hold
+    # the ticker. It must be pulled directly and re-evaluated -> exited, not stranded.
+    import hedge.runner as runner_mod
+    t = "KXHIGHCHI-26JUN29-T80"
+    client = _RunnerClient()
+    client.market_fields = {t: {"yes_bid": 53, "yes_ask": 55}}
+    client.positions_payload = [
+        {"ticker": t, "position_fp": "-4.00", "market_exposure_dollars": "1.80"}]
+    monkeypatch.setattr(runner_mod, "STATIONS", {"KXHIGHCHI": object()})
+    monkeypatch.setattr(runner_mod, "discover_temp_markets", lambda c, s, status: [])
+    monkeypatch.setattr(runner_mod, "LIVE_DIR", tmp_path)
+    ex = Executor(client, env="demo", dry_run=False)
+    r = Runner(client, [_BullStrategy()], ex, _MANAGE, bankroll_override=1000.0)
+    tickets = r.run_cycle()
+    tk = next(x for x in tickets if x.decision.ticker == t)
+    assert tk.decision.action is Action.SELL and tk.decision.side is Side.NO
+    assert tk.decision.count == 4 and tk.placed is True
+    assert len(client.orders) == 1
+
+
+def test_sell_to_exit_not_blocked_on_unvalidated_prod_station(monkeypatch, tmp_path):
+    # The validated-station gate must NEVER trap real money: a risk-reducing SELL on
+    # an unvalidated/unknown station still executes (only opening BUYs are gated).
+    import hedge.runner as runner_mod
+    t = "KXHIGHSEA-26JUN29-T80"   # not in the station map -> unvalidated
+    client = _RunnerClient()
+    client.market_fields = {t: {"yes_bid": 53, "yes_ask": 55}}
+    client.positions_payload = [
+        {"ticker": t, "position_fp": "-4.00", "market_exposure_dollars": "1.80"}]
+    monkeypatch.setattr(runner_mod, "STATIONS", {"KXHIGHSEA": object()})
+    monkeypatch.setattr(runner_mod, "discover_temp_markets", lambda c, s, status: [])
+    monkeypatch.setattr(runner_mod, "LIVE_DIR", tmp_path)
+    ex = Executor(client, env="prod", dry_run=False, allow_prod=True)
+    r = Runner(client, [_BullStrategy()], ex, _MANAGE, bankroll_override=1000.0)
+    tickets = r.run_cycle()
+    tk = next(x for x in tickets if x.decision.ticker == t)
+    assert tk.decision.action is Action.SELL and tk.decision.side is Side.NO
+    assert tk.decision.count == 4 and tk.placed is True

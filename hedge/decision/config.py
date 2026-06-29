@@ -21,6 +21,16 @@ class RiskConfig:
     portfolio_cap: float = 0.30     # max total bankroll fraction at risk
     rebalance_band: float = 0.25    # only rebalance if target drifts > this frac
 
+    # Intraday position management (trim / add / flip-to-exit existing holdings).
+    # OFF by default and deliberately so: turning it on activates the engine's
+    # reconcile path against live positions, which a review found has open blockers
+    # — intraday SELL P&L is not booked into the daily-loss stop, and there is no
+    # anti-churn cooldown, so a noisy day can flip-flop a position and bleed fees
+    # invisibly. Keep False until those are fixed AND the strategy's edge is proven
+    # on realized, market-priced, fee-net P&L. When False the runner only OPENS new
+    # positions (and reads holdings for the portfolio cap); it never trims/flips.
+    manage_positions: bool = False
+
     # Hard absolute ceiling on dollars-at-risk per order (None = no absolute cap,
     # fractions still apply). A backstop for early live trading so a mis-read
     # bankroll can't size large — caps in dollars, not just bankroll fraction.

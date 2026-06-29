@@ -24,4 +24,11 @@ VOLUME ["/data"]
 # Worker loop. KALSHI_ENV (demo|prod) is the real demo/prod switch; --allow-prod
 # only PERMITS prod, the env var GATES it (defaults to demo in fly.toml). Caps in
 # config.yaml (λ, $25/order, $50/day, validated cities) bound real-money risk.
-CMD ["python", "-m", "hedge.runner", "--live", "--interval", "1800", "--allow-prod"]
+#
+# PAUSED (real money): `--live` is intentionally REMOVED. The loop still reconciles
+# orders, backfills fills, and books settlement P&L on existing positions — but
+# places NO new orders (dry-run) — while we prove the strategy's edge on realized,
+# market-priced P&L. Re-arm by restoring `--live` (and only after the position-
+# management blockers are fixed and the edge clears the bar). --allow-prod is kept
+# so re-arming is a one-token change.
+CMD ["python", "-m", "hedge.runner", "--interval", "1800", "--allow-prod"]

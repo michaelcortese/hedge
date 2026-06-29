@@ -8,8 +8,11 @@ This is the live counterpart to the paper tournament. Each cycle it:
     4. routes each signal through the decision engine, picking the single
        best-edge decision per market (strategies share one order book, so we
        never stack conflicting orders on the same ticker),
-    5. hands tradable decisions to the ``Executor``,
-    6. logs every decision (acted-on or not) for later review.
+    5. (optional, ``cfg.manage_positions``, default OFF) reconciles every OPEN
+       position against the current model — trim / add / flip-to-exit — incl.
+       positions discovery missed; off by default pending churn/P&L-accounting fixes,
+    6. hands tradable decisions to the ``Executor``,
+    7. logs every decision (acted-on or not) for later review.
 
 Safety: the executor is DRY-RUN by default and refuses prod without an explicit
 opt-in, so ``python -m hedge.runner`` out of the box only *reports* what it would
@@ -90,8 +93,17 @@ class Runner:
             return 0.0
 
     def positions(self) -> dict[str, Position]:
-        """Map ticker -> current Position. Kalshi `position` is signed: positive =
-        long YES, negative = long NO."""
+        """Map ticker -> current Position from Kalshi (the source of truth).
+
+        Kalshi's net holding is signed: positive = long YES, negative = long NO.
+        The live API reports it as ``position_fp`` (a fixed-point STRING, e.g.
+        ``"-4.00"``) and the cost basis as ``market_exposure_dollars`` (a dollar
+        STRING). Older payloads used integer ``position`` (contracts) and
+        ``market_exposure`` (cents); we read the dollar fields first and fall back
+        to the legacy ones so a field rename can't silently blind us to our holdings
+        (which is exactly the bug that let positions go unmanaged: the engine's
+        flip/trim/add reconciliation only fires when it is handed a Position).
+        """
         out: dict[str, Position] = {}
         try:
             data = self.client.get_positions()
@@ -100,16 +112,45 @@ class Runner:
             return out
         for mp in data.get("market_positions", []) or []:
             ticker = mp.get("ticker")
-            net = int(mp.get("position", 0) or 0)
+            pos_fp = mp.get("position_fp")
+            net = round(float(pos_fp)) if pos_fp not in (None, "") \
+                else int(mp.get("position", 0) or 0)
             if not ticker or net == 0:
                 continue
             side = Side.YES if net > 0 else Side.NO
-            # market_exposure is in cents and reflects cost basis when present.
             count = abs(net)
-            exposure = float(mp.get("market_exposure", 0) or 0) / 100.0
+            exp_d = mp.get("market_exposure_dollars")
+            exposure = float(exp_d) if exp_d not in (None, "") \
+                else float(mp.get("market_exposure", 0) or 0) / 100.0
             avg = exposure / count if count else 0.0
             out[ticker] = Position(side=side, count=count, avg_price=avg)
         return out
+
+    def _held_ticker_views(self, positions: dict[str, Position],
+                           covered: set[str]) -> list[MarketView]:
+        """Build a MarketView for every HELD ticker that today's discovery missed.
+
+        Discovery only returns currently-open markets in our covered series, so a
+        position can fall outside it — settlement is near and it aged out, the series
+        is no longer discovered, or (the case that motivates this) a freshly redeployed
+        bot inherits positions and must re-evaluate them against the *current* model
+        rather than holding blindly to settlement. Pulling each held market directly
+        lets the same decide()/_reconcile() path trim, add to, or exit it. A market
+        with no two-sided quote (e.g. already settled) yields no MarketQuote later and
+        is skipped — settlement booking handles those.
+        """
+        extra: list[MarketView] = []
+        for ticker in positions:
+            if ticker in covered:
+                continue
+            try:
+                raw = self.client.get_market(ticker).get("market", {}) or {}
+            except Exception as e:  # noqa: BLE001
+                print(f"[runner] manage: no market for {ticker} ({e}); skipped", flush=True)
+                continue
+            if raw:
+                extra.append(MarketView(raw.get("ticker", ticker), raw))
+        return extra
 
     def market_views(self) -> list[MarketView]:
         views: list[MarketView] = []
@@ -260,6 +301,15 @@ class Runner:
         bankroll = self.bankroll()
         positions = self.positions()
         views = self.market_views()
+        # Intraday position management (gated by cfg.manage_positions, default OFF).
+        # When on, re-evaluate EVERY open position each cycle — not just markets in
+        # today's discovery — so the engine can trim / add / flip-to-exit, including
+        # positions inherited after a redeploy. When off (the safe default), we only
+        # OPEN new positions; existing holdings are read for the portfolio cap but
+        # never reconciled. See RiskConfig.manage_positions for why it's off.
+        if self.cfg.manage_positions:
+            covered = {v.ticker for v in views}
+            views += self._held_ticker_views(positions, covered)
         self._heartbeat(bankroll, positions)
 
         # Capital already at risk in open positions seeds the portfolio cap.
@@ -278,11 +328,14 @@ class Runner:
             # Risk context as it stood when this market was decided (before we reserve
             # capital for its own order below) — logged for later reconstruction.
             par_at_decision = portfolio_at_risk
-            # Settlement-station gate: never open real-money risk on a station whose
+            # Settlement-station gate: never OPEN/ADD real-money risk on a station whose
             # (series -> NWS station) mapping hasn't been validated against resolved
             # markets. A wrong station yields a confident-but-biased p that Kelly
             # punishes hard (CLAUDE.md). Demo/dry-run still trade it to gather data.
-            if decision.is_trade and self._blocks_unvalidated(decision.ticker):
+            # A SELL (reducing/closing risk) is NEVER blocked — we must always be able
+            # to exit a position, even one on a since-invalidated station.
+            if (decision.is_trade and decision.action is Action.BUY
+                    and self._blocks_unvalidated(decision.ticker)):
                 decision = Decision(
                     ticker=decision.ticker, action=Action.HOLD,
                     prob=decision.prob, sigma=decision.sigma,
@@ -378,15 +431,46 @@ class Runner:
             elif status in ("executed", "canceled"):
                 self.state.update_order(coid, status=status, fill_count=fill)
 
+    @staticmethod
+    def _fill_count(f: dict) -> float:
+        """Filled contracts on one fill. Live Kalshi uses ``count_fp`` (a fixed-point
+        STRING, e.g. ``"542.00"`` — and genuinely fractional, e.g. ``"382.59"``, from
+        pro-rata maker matching); older payloads used integer ``count``. Read the
+        ``_fp`` field first so a renamed key can't silently zero every fill (which is
+        exactly what left the fills table empty: ``count`` does not exist on the live
+        payload, so every fill was skipped and no P&L was ever booked)."""
+        cf = f.get("count_fp")
+        if cf not in (None, ""):
+            return float(cf)
+        return float(f.get("count", 0) or 0)
+
+    @staticmethod
+    def _fill_price_cents(f: dict, side: str) -> float | None:
+        """Per-contract fill price for ``side`` in CENTS. Live Kalshi reports
+        ``{yes,no}_price_dollars`` (STRING dollars, e.g. ``"0.9800"``); older payloads
+        used integer-cent ``{yes,no}_price``. Read dollars first, else legacy cents."""
+        kd = "yes_price_dollars" if side == "yes" else "no_price_dollars"
+        kc = "yes_price" if side == "yes" else "no_price"
+        if f.get(kd) not in (None, ""):
+            return float(f[kd]) * 100.0
+        if f.get(kc) is not None:
+            return float(f[kc])
+        return None
+
     def _reconcile_fills(self) -> None:
         """Pull actual broker fills and persist them as the source of truth for P&L.
 
-        Reads ``GET /portfolio/fills`` (authoritative per-contract entry prices in
-        cents), aggregates by broker ``order_id``, matches each back to one of our
-        recorded orders, and upserts a ``fills`` row (filled count, avg entry price,
-        taker fee). This captures both immediate IOC-taker fills (gone from the order
-        listing before the next cycle) and makers that fill later. Best-effort: a
-        broker hiccup just retries next cycle.
+        Reads ``GET /portfolio/fills``, aggregates by broker ``order_id``, matches each
+        back to one of our recorded orders, and upserts a ``fills`` row (filled count,
+        avg entry price in cents, fee in cents). Captures both immediate IOC-taker
+        fills (gone from the order listing before the next cycle) and makers that fill
+        later. Uses the broker's actual ``fee_cost`` (dollars) when present — most of
+        our fills are post-only makers and settle fee-free — falling back to the taker
+        estimate only when the broker omits it. Best-effort: a hiccup retries next cycle.
+
+        NOTE: the fills ``action``/``book_side`` are YES-centric (buying NO is reported
+        as ``action="sell"``/``book_side="ask"``), so they do NOT by themselves mark an
+        open vs a close; ``side`` (yes/no) + price is what settlement P&L is computed on.
         """
         from hedge.tournament.paper import taker_fee
         try:
@@ -399,26 +483,31 @@ class Runner:
             side = (f.get("side") or "").lower()
             if not oid or side not in ("yes", "no"):
                 continue
-            n = int(float(f.get("count", 0) or 0))
-            px = f.get("yes_price") if side == "yes" else f.get("no_price")
+            n = self._fill_count(f)
+            px = self._fill_price_cents(f, side)
             if n <= 0 or px is None:
                 continue
-            px = float(px)  # cents
-            a = agg.setdefault(oid, {"count": 0, "notional": 0.0, "fee": 0.0,
+            a = agg.setdefault(oid, {"count": 0.0, "notional": 0.0, "fee": 0.0,
                                      "side": side, "action": (f.get("action") or "buy").lower()})
             a["count"] += n
             a["notional"] += px * n
-            if bool(f.get("is_taker", True)):
-                a["fee"] += taker_fee(px / 100.0) * 100.0 * n  # per-contract $ -> total cents
+            fc = f.get("fee_cost")
+            if fc not in (None, ""):
+                a["fee"] += float(fc) * 100.0                       # broker truth ($ -> cents)
+            elif bool(f.get("is_taker", True)):
+                a["fee"] += taker_fee(px / 100.0) * 100.0 * n       # estimate only if absent
         for oid, a in agg.items():
             row = self.state.order_for_oid(oid)
             if row is None:
                 continue  # a fill we have no record of placing — leave it to manual review
+            count = round(a["count"])
+            if count <= 0:
+                continue
             avg = a["notional"] / a["count"] if a["count"] else None
             try:
                 self.state.record_fill(
                     row["client_order_id"], row["ticker"], a["side"], a["action"],
-                    a["count"], order_id=oid, avg_price_cents=avg,
+                    count, order_id=oid, avg_price_cents=avg,
                     fee_cents=a["fee"], status="executed")
             except Exception as e:  # noqa: BLE001
                 print(f"[runner] record_fill failed for {oid} ({e})", flush=True)
@@ -520,7 +609,9 @@ class Runner:
 
         Picks the largest-edge tradable decision. If none trade, returns the first
         HOLD so it's still logged (with its reason)."""
-        position = positions.get(view.ticker)
+        # Only hand the engine the existing position when intraday management is
+        # enabled; otherwise treat each market as a fresh open (no trim/flip/exit).
+        position = positions.get(view.ticker) if self.cfg.manage_positions else None
         best_trade: tuple[Decision, str] | None = None
         first_hold: tuple[Decision, str] | None = None
         for strat in self.strategies:
