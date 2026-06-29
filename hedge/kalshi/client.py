@@ -38,15 +38,23 @@ class KalshiError(RuntimeError):
 class KalshiClient:
     def __init__(
         self,
-        auth: KalshiAuth,
+        auth: KalshiAuth | None = None,
         base_url: str = DEMO_BASE,
         timeout: float = 10.0,
         session: requests.Session | None = None,
     ):
+        # ``auth=None`` is a READ-ONLY client: Kalshi's market-data endpoints are
+        # public, so we can capture live prod prices with no key. Any portfolio/order
+        # call (which needs signing) raises instead of sending an unsigned request.
         self.auth = auth
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.session = session or requests.Session()
+
+    @classmethod
+    def read_only(cls, base_url: str = PROD_BASE, **kw: Any) -> "KalshiClient":
+        """A keyless client for public market data (defaults to prod)."""
+        return cls(auth=None, base_url=base_url, **kw)
 
     # ----- core request plumbing -------------------------------------------
 
@@ -71,7 +79,13 @@ class KalshiClient:
     ) -> dict[str, Any]:
         signed_path = self._signed_path(path)
         url = self.base_url.replace(_API_PREFIX, "") + signed_path
-        headers = self.auth.headers(method, signed_path)
+        if self.auth is None:
+            if method.upper() != "GET":
+                raise KalshiError(0, "read-only client cannot place/modify orders "
+                                  "(build with credentials to trade)", method, signed_path)
+            headers = {}
+        else:
+            headers = self.auth.headers(method, signed_path)
         headers["Content-Type"] = "application/json"
 
         resp = self.session.request(
@@ -118,45 +132,28 @@ class KalshiClient:
         return self._request("GET", "/portfolio/fills", params=filters or None)
 
     def get_orders(self, **filters: Any) -> dict[str, Any]:
+        """List orders. Filters: ticker, status (resting|canceled|executed), limit, cursor.
+
+        Reads stay on ``/portfolio/orders`` (still live); only create/cancel moved to
+        the V2 ``/portfolio/events/orders`` family.
+        """
         return self._request("GET", "/portfolio/orders", params=filters or None)
 
-    def create_order(
-        self,
-        *,
-        ticker: str,
-        action: str,            # "buy" | "sell"
-        side: str,              # "yes" | "no"
-        count: int,
-        type: str = "limit",    # "limit" | "market"
-        yes_price: int | None = None,   # cents 1-99 (supply exactly one of
-        no_price: int | None = None,    # yes_price / no_price for a limit order)
-        client_order_id: str | None = None,
-        time_in_force: str | None = None,
-        **extra: Any,
-    ) -> dict[str, Any]:
-        """Place an order. Prices are integer cents (1-99).
+    def get_order(self, order_id: str) -> dict[str, Any]:
+        """Fetch a single order's current state (status + fill counts) by id."""
+        return self._request("GET", f"/portfolio/orders/{order_id}")
 
-        To bet AGAINST an outcome, buy the NO side (action="buy", side="no") —
-        Kalshi has no margin short. action="sell" closes/reduces a position you
-        already hold.
+    def create_order(self, **body: Any) -> dict[str, Any]:
+        """Place an order via the Kalshi **V2** endpoint (``/portfolio/events/orders``).
+
+        The V1 ``/portfolio/orders`` create endpoint is deprecated (HTTP 410). The
+        V2 model is YES-priced and side-only (``side`` bid/ask, single ``price`` in
+        dollars, ``time_in_force``); the body is built by
+        :func:`hedge.execution.executor.build_order_body`. Always include a
+        ``client_order_id`` (UUID) for idempotency — Kalshi rejects duplicates.
         """
-        body: dict[str, Any] = {
-            "ticker": ticker,
-            "action": action,
-            "side": side,
-            "count": count,
-            "type": type,
-        }
-        if yes_price is not None:
-            body["yes_price"] = yes_price
-        if no_price is not None:
-            body["no_price"] = no_price
-        if client_order_id is not None:
-            body["client_order_id"] = client_order_id
-        if time_in_force is not None:
-            body["time_in_force"] = time_in_force
-        body.update(extra)
-        return self._request("POST", "/portfolio/orders", json=body)
+        return self._request("POST", "/portfolio/events/orders", json=body)
 
     def cancel_order(self, order_id: str) -> dict[str, Any]:
-        return self._request("DELETE", f"/portfolio/orders/{order_id}")
+        """Cancel a resting order by id (V2)."""
+        return self._request("DELETE", f"/portfolio/events/orders/{order_id}")

@@ -37,6 +37,21 @@ def _load_yaml() -> dict:
     return {}
 
 
+def _materialize_pem(pem: str) -> str:
+    """Write a PEM (from the ``KALSHI_PRIVATE_KEY`` secret) to a private 0600 file.
+
+    Fly delivers secrets as env vars; the auth layer wants a path. We persist under
+    ``HEDGE_STATE_DIR`` (the volume) so it's written once and reused. ``\\n`` escapes
+    are normalized in case the secret was set as a single line.
+    """
+    target = Path(os.environ.get("HEDGE_STATE_DIR", "data/runs/live")) / "kalshi_key.pem"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    body = pem.replace("\\n", "\n")
+    target.write_text(body if body.endswith("\n") else body + "\n")
+    os.chmod(target, 0o600)
+    return str(target)
+
+
 def resolve_credentials(env: str | None = None) -> tuple[str, str, str]:
     """Return ``(key_id, private_key_path, base_url)`` for the active environment.
 
@@ -53,6 +68,12 @@ def resolve_credentials(env: str | None = None) -> tuple[str, str, str]:
     key_id = os.environ.get("KALSHI_KEY_ID") or section.get("key_id") or cfg.get("key_id")
     key_path = (os.environ.get("KALSHI_PRIVATE_KEY_PATH")
                 or section.get("private_key_path") or cfg.get("private_key_path"))
+
+    # Container/Fly path: the PEM is delivered as a SECRET (env var contents), not a
+    # file. Materialize it to a private file once so the rest of the code is unchanged.
+    pem = os.environ.get("KALSHI_PRIVATE_KEY")
+    if pem and (not key_path or not Path(key_path).exists()):
+        key_path = _materialize_pem(pem)
     base_url = (os.environ.get("KALSHI_BASE_URL")
                 or section.get("base_url")
                 or (cfg.get("base_urls", {}) or {}).get(env)
