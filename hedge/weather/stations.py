@@ -40,17 +40,18 @@ class Station:
 # after each new row is validated against a resolved market.
 #
 # NOTE: the NWS official *climate* site is not always the city's main airport.
-# These are the commonly-cited Kalshi settlement points; `validated=False` flags
-# that they still need a live cross-check (Austin in particular — Kalshi has used
-# Camp Mabry / KATT historically, not Bergstrom / KAUS).
-# validated flags set by scripts/validate_stations.py against 7 days of resolved
-# Kalshi settlements vs each station's actual ASOS daily max (±1°F bucket tolerance):
-#   CHI KMDW 100% (beats KORD 86%), MIA KMIA 100% (beats KFLL 86%),
-#   AUS KAUS 100% (KATT only ties — the Camp Mabry worry is unsupported).
-# NY left UNVALIDATED: KNYC ties at ±1°F but at exact match KLGA (86%) beat
-# KNYC (57%) — collect another week before trusting NY with real size.
+# These are the commonly-cited Kalshi settlement points.
+# validated flags set by scripts/validate_stations.py against 14 days of resolved
+# Kalshi settlements vs each station's official NWS Climatological Report (Daily)
+# high — the value Kalshi actually settles on (exact bucket match, tol=0):
+#   NY  KNYC 100% (vs KLGA 43%, KJFK 50%),  CHI KMDW 100% (vs KORD 64%),
+#   MIA KMIA 100% (vs KFLL 21%),            AUS KAUS 100% (vs KATT 86%).
+# NY was previously left unvalidated ONLY because the old check compared against the
+# raw ASOS observed max (KNYC 57% vs KLGA 86%); that disagreed with the CLI Daily
+# report by exactly the rounding/conversion nuance the market rules warn about.
+# Against the correct instrument (CLI), KNYC/Central Park is unambiguous — 14/14.
 _STATION_LIST: list[Station] = [
-    Station("KXHIGHNY", "New York City", "KNYC", 40.78, -73.97, "America/New_York"),
+    Station("KXHIGHNY", "New York City", "KNYC", 40.78, -73.97, "America/New_York", validated=True),
     Station("KXHIGHCHI", "Chicago", "KMDW", 41.79, -87.75, "America/Chicago", validated=True),
     Station("KXHIGHMIA", "Miami", "KMIA", 25.79, -80.29, "America/New_York", validated=True),
     Station("KXHIGHAUS", "Austin", "KAUS", 30.19, -97.67, "America/Chicago", validated=True),

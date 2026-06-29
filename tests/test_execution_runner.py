@@ -202,10 +202,11 @@ def _wire_market(monkeypatch, runner_mod, ticker, tmp_path):
 
 
 def test_prod_blocks_unvalidated_station(monkeypatch, tmp_path):
-    # KXHIGHNY is intentionally left validated=False; a real PROD order must be refused.
+    # KXHIGHSEA is not in the station map (station_for_ticker -> None); a real PROD
+    # order on an unvalidated/unknown station must be refused.
     import hedge.runner as runner_mod
     client = _RunnerClient()
-    _wire_market(monkeypatch, runner_mod, "KXHIGHNY-26JUN29-T80", tmp_path)
+    _wire_market(monkeypatch, runner_mod, "KXHIGHSEA-26JUN29-T80", tmp_path)
     ex = Executor(client, env="prod", dry_run=False, allow_prod=True)
     runner = Runner(client, [_BullStrategy()], ex, RiskConfig(), bankroll_override=1000.0)
     tickets = runner.run_cycle()
@@ -229,7 +230,7 @@ def test_demo_still_trades_unvalidated_station(monkeypatch, tmp_path):
     # The gate only applies to real PROD money; demo trades unvalidated for data.
     import hedge.runner as runner_mod
     client = _RunnerClient()
-    _wire_market(monkeypatch, runner_mod, "KXHIGHNY-26JUN29-T80", tmp_path)
+    _wire_market(monkeypatch, runner_mod, "KXHIGHSEA-26JUN29-T80", tmp_path)
     ex = Executor(client, env="demo", dry_run=False)
     runner = Runner(client, [_BullStrategy()], ex, RiskConfig(), bankroll_override=1000.0)
     runner.run_cycle()

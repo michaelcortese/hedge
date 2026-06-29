@@ -10,10 +10,15 @@ What this does, per city:
   1. Pull recently SETTLED Kalshi markets (public read-only, no key needed) and, for
      each (city, day) event, read the YES-resolved bucket -> the official settled
      daily-high range, e.g. "81 to 82".
-  2. For each CANDIDATE NWS station, fetch that station's actual ASOS observed daily
-     max (api.weather.gov) for the same day and check whether it lands in the settled
-     range. This is the real settlement instrument — not ERA5, which is too coarse to
-     tell e.g. KMDW from KORD.
+  2. For each CANDIDATE NWS station, fetch that station's official **NWS
+     Climatological Report (Daily)** high — the value Kalshi actually settles on,
+     parsed from the CLI product (Iowa Environmental Mesonet) — for the same day and
+     check whether it lands in the settled range. Falls back to the preliminary ASOS
+     observed max only when no CLI has been issued; the report tags which was used.
+     Validating against raw ASOS (the prior approach) wrongly condemned KNYC, because
+     obs max differs from the CLI value by exactly the rounding/conversion nuances the
+     market rules warn about. This is the real settlement instrument — not ERA5, which
+     is too coarse to tell e.g. KMDW from KORD.
   3. Report a per-candidate match rate. The current map is only trustworthy if its
      station is the best match at a high rate. Alternatives (KORD for Chicago, KATT /
      Camp Mabry for Austin) are tested side-by-side so a wrong map is obvious.
@@ -102,8 +107,47 @@ def _settled_high_range(series: str, since: date) -> dict[date, tuple[float, flo
     return out
 
 
+def _cli_daily_high(nws_id: str, day: date) -> float | None:
+    """Official daily high (°F) from the NWS **Climatological Report (Daily)**.
+
+    THIS is what Kalshi settles on ("the highest temperature ... as reported by the
+    NWS Climatological Report (Daily)"), NOT the raw ASOS observation stream. The two
+    differ by exactly the rounding/conversion nuances the market rules warn about, so
+    validating against the obs max can wrongly condemn the correct station (it flagged
+    NYC/KNYC as a poor match when KNYC/Central Park is in fact the official site).
+
+    Sourced from the Iowa Environmental Mesonet, which parses the CLI text products
+    into JSON keyed by the issuing site id (e.g. ``KNYC`` = Central Park). Returns the
+    already-rounded whole-°F high, or None if no CLI has been issued for that day yet.
+    """
+    # The endpoint ignores month/day and returns the WHOLE year's reports in
+    # ``results``; we must select the row whose ``valid`` matches the requested day
+    # (taking results[0] silently returns Jan 1). Cache per-year to avoid refetching.
+    data = _get_json(
+        "https://mesonet.agron.iastate.edu/json/cli.py",
+        {"station": nws_id, "year": day.year},
+        f"cli:{nws_id}:{day.year}", ttl=None,
+    )
+    if not data:
+        return None
+    target = day.isoformat()
+    results = data.get("results") if isinstance(data.get("results"), list) else []
+    row = next((r for r in results if r.get("valid") == target), None)
+    if row is None:
+        return None
+    high = row.get("high")
+    try:
+        return float(high) if high is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _station_obs_max(nws_id: str, day: date, tz: str) -> float | None:
-    """Actual ASOS observed daily max (°F) for the station-local ``day``, or None."""
+    """ASOS observed daily max (°F) — the FALLBACK truth when no CLI exists yet.
+
+    Preliminary and subject to the rounding/conversion nuances above, so it is only
+    used (clearly labeled) when the official CLI Daily report is unavailable.
+    """
     z = ZoneInfo(tz)
     start = datetime(day.year, day.month, day.day, tzinfo=z).astimezone(timezone.utc)
     end = start + timedelta(days=1)
@@ -125,6 +169,22 @@ def _station_obs_max(nws_id: str, day: date, tz: str) -> float | None:
         if start <= datetime.fromisoformat(ts.replace("Z", "+00:00")) < end:
             temps.append(c * 9 / 5 + 32)
     return max(temps) if temps else None
+
+
+def _station_daily_high(nws_id: str, day: date, tz: str) -> tuple[float, str] | None:
+    """The official daily high to validate against: CLI Daily report, else ASOS max.
+
+    Returns ``(high_f, source)`` where ``source`` is ``"CLI"`` (authoritative — what
+    Kalshi settles on) or ``"ASOS"`` (preliminary fallback), or None if neither is
+    available for the day.
+    """
+    cli = _cli_daily_high(nws_id, day)
+    if cli is not None:
+        return cli, "CLI"
+    obs = _station_obs_max(nws_id, day, tz)
+    if obs is not None:
+        return obs, "ASOS"
+    return None
 
 
 def _in_range(high: float, lo: float, hi: float, tol: float = 0.0) -> bool:
@@ -153,17 +213,20 @@ def main() -> None:
 
         best_id, best_rate = None, -1.0
         for nws_id, lat, lon in _CANDIDATES.get(series, [(station.nws_station, station.lat, station.lon)]):
-            hits = n = 0
+            hits = n = cli_days = 0
             for d, (lo, hi) in settled.items():
-                obs = _station_obs_max(nws_id, d, station.tz)
-                if obs is None:
+                truth = _station_daily_high(nws_id, d, station.tz)
+                if truth is None:
                     continue
+                high, source = truth
                 n += 1
-                hits += _in_range(obs, lo, hi, args.tol)
+                cli_days += source == "CLI"
+                hits += _in_range(high, lo, hi, args.tol)
             rate = hits / n if n else 0.0
             flag = "  <- current" if nws_id == station.nws_station else ""
-            cov = f"{hits}/{n}" if n else "no obs"
-            print(f"    {nws_id:5} match {cov:>6}  rate={rate:.0%}{flag}")
+            cov = f"{hits}/{n}" if n else "no data"
+            src = f"  [{cli_days}/{n} CLI]" if n else ""
+            print(f"    {nws_id:5} match {cov:>6}  rate={rate:.0%}{src}{flag}")
             if n >= args.min_days and rate > best_rate:
                 best_id, best_rate = nws_id, rate
 

@@ -124,8 +124,27 @@ def build_distribution(
     if floor_high is not None:
         samples = np.maximum(samples, floor_high)
 
-    draws = np.rint(samples).astype(int)
+    draws = _nws_round(samples)
     return HighTempDistribution(draws=draws, center=center, sigma=sigma)
+
+
+def _nws_round(samples: "np.ndarray") -> "np.ndarray":
+    """Round °F samples to the official whole-degree high the way NWS settles.
+
+    Two settlement nuances Kalshi's rules explicitly warn about ("rounding and
+    conversion nuances"), both of which bias a 1°-wide bucket if we get them wrong:
+
+    * **Half rounds UP.** NWS rounds x.5 away from zero (80.5 -> 81), whereas
+      ``np.rint`` rounds half-to-even (80.5 -> 80). Use ``floor(x + 0.5)`` so the
+      model's rounding matches the settlement's. (Continuous samples rarely hit an
+      exact .5, but the convention also removes a systematic lean toward even °F.)
+    * **°C->°F conversion.** The official daily max is derived from ASOS readings
+      stored in tenths of a °C, then converted to °F and rounded — so true highs
+      cluster on the °F values reachable from a tenth-°C grid. Our forecast feed is
+      already continuous °F, so we don't re-quantize here, but downstream callers
+      comparing to settlement should treat near-boundary mass as genuinely uncertain.
+    """
+    return np.floor(np.asarray(samples, dtype=float) + 0.5).astype(int)
 
 
 #: Share of the calibrated model error that is *shared* across ensemble members

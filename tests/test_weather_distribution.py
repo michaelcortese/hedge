@@ -7,11 +7,20 @@ import math
 import numpy as np
 
 from hedge.weather.distribution import (
+    _nws_round,
     bucket_prob_and_se,
     build_distribution,
     clamp_prob,
 )
 from hedge.weather.markets import parse_temp_market
+
+
+def test_nws_round_is_half_up_not_banker():
+    # NWS settles by rounding x.5 UP (away from zero), unlike numpy's half-to-even.
+    out = _nws_round(np.array([80.5, 81.5, 80.4, 80.6, 81.0]))
+    assert list(out) == [81, 82, 80, 81, 81]
+    # np.rint (banker's) would give 80 and 82 for 80.5/81.5 — the bug we fixed.
+    assert _nws_round(np.array([80.5]))[0] == 81 != np.rint(80.5)
 
 
 def _market(lo=None, hi=None, **kw):
