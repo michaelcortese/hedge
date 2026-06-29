@@ -159,7 +159,7 @@ hedge/
   execution/             # decision -> signed order
     executor.py          # build order body, idempotency, dry-run/prod guards
   guard.py               # calibration kill-switch: halt if realized Brier drifts
-  state.py               # durable SQLite state (orders, daily P&L, cycle seq) — crash-safe
+  state.py               # durable SQLite state (orders, fills, decisions, daily P&L) — crash-safe
   alerts.py              # push notifications (ntfy/Pushover/Slack), best-effort
   runner.py              # main loop: signals -> decide -> execute (dry-run default)
 config.example.yaml      # copy to config.yaml (gitignored) and fill in
@@ -167,11 +167,13 @@ scripts/test_auth.py     # auth smoke test (offline + optional live)
 scripts/run_backtest.py  # historical tournament -> leaderboard (no creds needed)
 scripts/run_paper.py     # paper tournament: snapshot/loop/score/edge (+ --prod read-only)
 scripts/run_live.py      # the trading loop (dry-run by default; --live to arm)
+scripts/db_report.py     # read-only views over hedge.db: decisions/trades/calibration/pnl
 scripts/validate_stations.py  # validate settlement stations vs resolved markets
 Dockerfile / fly.toml    # container + Fly.io worker config (24/7 deploy)
 .dockerignore            # keeps secrets/state out of the image
 deploy/config.yaml       # secrets-free risk/guard caps baked into the image
 docs/DEPLOYMENT_PLAN.md  # phased 24/7 autonomous-deploy plan (cited)
+docs/GO_LIVE_PLAN.md     # real-money go-live + full-logging plan (Track A done)
 docs/RUNBOOK.md          # exact fly deploy + operations commands
 ```
 

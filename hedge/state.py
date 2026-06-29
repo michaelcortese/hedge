@@ -30,6 +30,16 @@ from pathlib import Path
 #: Order statuses we treat as "still working" (not yet a settled position/closed).
 OPEN_STATUSES = ("placed", "pending", "resting", "partial")
 
+#: Columns of the ``decisions`` table, in insert order. One row per market per cycle
+#: (including HOLDs) — the canonical, queryable record we learn from. Kept as a tuple
+#: so :meth:`State.record_decision` can take an ergonomic dict and insert positionally.
+DECISION_COLS = (
+    "cycle_seq", "ts", "utc_date", "ticker", "strategy", "action", "side",
+    "count", "price_cents", "prob", "sigma", "edge", "kelly_fraction",
+    "yes_bid", "yes_ask", "mid", "last", "bankroll", "portfolio_at_risk",
+    "placed", "dry_run", "error", "reason", "client_order_id", "meta_json",
+)
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -78,19 +88,75 @@ class State:
                 updated_ts  TEXT NOT NULL
             );
             -- Tickers whose realized P&L has already been booked, so we never
-            -- double-count a settlement into daily_pnl.
+            -- double-count a settlement into daily_pnl. Extra columns (side, entry,
+            -- count, outcome) make each row a complete trade record for review.
             CREATE TABLE IF NOT EXISTS settled (
                 ticker      TEXT PRIMARY KEY,
                 utc_date    TEXT NOT NULL,
                 pnl         REAL NOT NULL,
                 ts          TEXT NOT NULL
             );
+            -- Every decision, one row per market per cycle (incl. HOLD): the model's
+            -- belief, the market it priced against, the order it intended, and whether
+            -- it went through. This is the substrate the learning loop queries.
+            CREATE TABLE IF NOT EXISTS decisions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_seq       INTEGER NOT NULL,
+                ts              TEXT NOT NULL,
+                utc_date        TEXT NOT NULL,
+                ticker          TEXT NOT NULL,
+                strategy        TEXT,
+                action          TEXT NOT NULL,
+                side            TEXT,
+                count           INTEGER NOT NULL DEFAULT 0,
+                price_cents     INTEGER NOT NULL DEFAULT 0,
+                prob            REAL,
+                sigma           REAL,
+                edge            REAL,
+                kelly_fraction  REAL,
+                yes_bid         REAL,
+                yes_ask         REAL,
+                mid             REAL,
+                last            REAL,
+                bankroll        REAL,
+                portfolio_at_risk REAL,
+                placed          INTEGER NOT NULL DEFAULT 0,
+                dry_run         INTEGER NOT NULL DEFAULT 0,
+                error           TEXT,
+                reason          TEXT,
+                client_order_id TEXT,
+                meta_json       TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_decisions_day ON decisions(utc_date, ticker);
+            -- Actual broker fills (NOT intent): the authoritative entry price/size we
+            -- realize P&L against. Keyed by client_order_id so partial->full upserts.
+            CREATE TABLE IF NOT EXISTS fills (
+                client_order_id TEXT PRIMARY KEY,
+                order_id        TEXT,
+                ticker          TEXT NOT NULL,
+                side            TEXT NOT NULL,
+                action          TEXT NOT NULL,
+                fill_count      INTEGER NOT NULL DEFAULT 0,
+                avg_price_cents REAL,
+                fee_cents       REAL,
+                status          TEXT,
+                ts              TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_fills_ticker ON fills(ticker);
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
             """
         )
+        # Older DBs predate the richer `settled` columns; add them idempotently so a
+        # deployed volume migrates in place without dropping booked P&L.
+        for col, decl in (("side", "TEXT"), ("entry_cents", "REAL"),
+                          ("count", "INTEGER"), ("outcome", "TEXT")):
+            try:
+                self.conn.execute(f"ALTER TABLE settled ADD COLUMN {col} {decl}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         self.conn.commit()
 
     # ----- orders ------------------------------------------------------------
@@ -130,6 +196,14 @@ class State:
             "SELECT * FROM orders WHERE client_order_id=?", (client_order_id,))
         return cur.fetchone()
 
+    def order_for_oid(self, order_id: str) -> sqlite3.Row | None:
+        """Look up our recorded order by the broker's order_id (for fill matching)."""
+        if not order_id:
+            return None
+        return self.conn.execute(
+            "SELECT * FROM orders WHERE order_id=? ORDER BY ts DESC LIMIT 1",
+            (order_id,)).fetchone()
+
     def has_open_order(self, ticker: str, side: str | None = None) -> bool:
         """True if we have a still-working order on this ticker (optionally side).
 
@@ -147,18 +221,84 @@ class State:
         q = f"SELECT * FROM orders WHERE status IN ({','.join('?' * len(OPEN_STATUSES))})"
         return list(self.conn.execute(q, OPEN_STATUSES).fetchall())
 
+    # ----- decisions (the learning substrate) --------------------------------
+    def record_decision(self, row: dict) -> None:
+        """Persist one decision (keys per :data:`DECISION_COLS`; missing -> NULL).
+
+        One row per market per cycle, HOLDs included — this is the canonical record
+        the learning loop queries. Best-effort: never let a logging row crash a cycle.
+        """
+        # NOT NULL columns must never receive a bare None (a HOLD row omits order
+        # fields); fall back to their schema defaults. SQLite stores bools as ints.
+        defaults = {"count": 0, "price_cents": 0, "placed": 0, "dry_run": 0}
+        vals = [row.get(c) if row.get(c) is not None else defaults.get(c)
+                for c in DECISION_COLS]
+        placeholders = ",".join("?" * len(DECISION_COLS))
+        self.conn.execute(
+            f"INSERT INTO decisions ({','.join(DECISION_COLS)}) VALUES ({placeholders})",
+            vals,
+        )
+        self.conn.commit()
+
+    def decisions_for(self, utc_date: str) -> list[sqlite3.Row]:
+        return list(self.conn.execute(
+            "SELECT * FROM decisions WHERE utc_date=? ORDER BY id", (utc_date,)).fetchall())
+
+    # ----- fills (broker truth — what actually traded) -----------------------
+    def record_fill(self, client_order_id: str, ticker: str, side: str, action: str,
+                    fill_count: int, *, order_id: str | None = None,
+                    avg_price_cents: float | None = None, fee_cents: float | None = None,
+                    status: str | None = None) -> None:
+        """Upsert an order's realized fill (keyed by client_order_id).
+
+        Accrues as partial fills become whole; COALESCE keeps a known price/fee if a
+        later update omits it. The recorded entry is authoritative for P&L booking.
+        """
+        self.conn.execute(
+            """INSERT INTO fills
+                 (client_order_id, order_id, ticker, side, action, fill_count,
+                  avg_price_cents, fee_cents, status, ts)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(client_order_id) DO UPDATE SET
+                 order_id=COALESCE(excluded.order_id, fills.order_id),
+                 fill_count=excluded.fill_count,
+                 avg_price_cents=COALESCE(excluded.avg_price_cents, fills.avg_price_cents),
+                 fee_cents=COALESCE(excluded.fee_cents, fills.fee_cents),
+                 status=COALESCE(excluded.status, fills.status)""",
+            (client_order_id, order_id, ticker, side, action, int(fill_count),
+             avg_price_cents, fee_cents, status, _now_iso()),
+        )
+        self.conn.commit()
+
+    def fills_for_ticker(self, ticker: str) -> list[sqlite3.Row]:
+        return list(self.conn.execute(
+            "SELECT * FROM fills WHERE ticker=? AND fill_count > 0", (ticker,)).fetchall())
+
+    def unsettled_fill_tickers(self) -> list[str]:
+        """Tickers we have real fills on that haven't been booked as settled yet."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT ticker FROM fills WHERE fill_count > 0 "
+            "AND ticker NOT IN (SELECT ticker FROM settled)").fetchall()
+        return [r["ticker"] for r in rows]
+
     # ----- daily P&L (for the daily-loss stop + heartbeat) -------------------
-    def book_settlement(self, ticker: str, pnl: float, *, utc_date: str | None = None) -> bool:
+    def book_settlement(self, ticker: str, pnl: float, *, utc_date: str | None = None,
+                        side: str | None = None, entry_cents: float | None = None,
+                        count: int | None = None, outcome: str | None = None) -> bool:
         """Record a settled market's realized P&L once. Returns False if already booked.
 
         Accumulates into ``daily_pnl`` for the settlement's UTC day so the daily-loss
-        stop sees it. Idempotent per ticker via the ``settled`` table.
+        stop sees it. Idempotent per ticker via the ``settled`` table. The optional
+        side/entry/count/outcome make the row a complete trade record for review.
         """
         if self.conn.execute("SELECT 1 FROM settled WHERE ticker=?", (ticker,)).fetchone():
             return False
         day = utc_date or _now_iso()[:10]
-        self.conn.execute("INSERT INTO settled (ticker, utc_date, pnl, ts) VALUES (?,?,?,?)",
-                          (ticker, day, float(pnl), _now_iso()))
+        self.conn.execute(
+            "INSERT INTO settled (ticker, utc_date, pnl, ts, side, entry_cents, count, outcome) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (ticker, day, float(pnl), _now_iso(), side, entry_cents,
+             int(count) if count is not None else None, outcome))
         self.conn.execute(
             """INSERT INTO daily_pnl (utc_date, realized, fees, updated_ts)
                VALUES (?,?,0,?)
