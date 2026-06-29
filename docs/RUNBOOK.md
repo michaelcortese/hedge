@@ -25,8 +25,12 @@ curl -d "hedge runbook test" https://ntfy.sh/hedge-alerts-7f3k9q2x
 Run from the repo root (where `fly.toml`, `Dockerfile`, `deploy/config.yaml` live):
 ```bash
 fly launch --no-deploy --name hedge-bot --region iad --copy-config
-fly volumes create hedge_data --region iad --size 1     # durable state/logs/PEM
+fly volumes create data --region iad --size 1     # durable state/logs/PEM (matches fly.toml mount)
 ```
+> ⚠️ **`fly launch` will try to add an `[http_service]` block to `fly.toml`.** DELETE it.
+> This is a worker, not a web server — with a service, Fly Proxy autostops the machine
+> as "excess capacity" (no inbound traffic) and never restarts it, killing the 24/7
+> loop. The committed `fly.toml` is already correct (no service). Keep it that way.
 
 ## 2. Set secrets — **DEMO first**
 ```bash

@@ -16,14 +16,12 @@ primary_region = 'iad'
   source = 'data'
   destination = '/data'
 
-[http_service]
-  internal_port = 8080
-  force_https = true
-  auto_stop_machines = 'stop'
-  auto_start_machines = true
-  min_machines_running = 0
-  processes = ['app']
+# NO [http_service]/[[services]]: this is a trading WORKER, not a web server. With a
+# service, Fly Proxy treats zero inbound traffic as "excess capacity" and autostops
+# the machine (which then never autostarts, since no request ever arrives) — that is
+# what killed the 24/7 loop. Removing it makes the app private and proxy-unmanaged.
 
+# Keep the single worker alive across crashes and clean exits.
 [[restart]]
   policy = 'always'
 
