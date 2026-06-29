@@ -226,8 +226,10 @@ class Runner:
         seq = self.state.next_cycle_seq()
         self._cycle_seq = seq   # client_order_ids are keyed on this (idempotency)
         # Reconcile our orders against broker truth (fills/cancels; cancel-replace
-        # stale resting makers) and book any newly-settled realized P&L.
+        # stale resting makers), pull actual fill economics, and book any
+        # newly-settled realized P&L from those fills.
         self._reconcile_orders()
+        self._reconcile_fills()
         self._book_settlements()
 
         # Circuit breaker first: never trade past a tripped/halted guard.
@@ -273,6 +275,9 @@ class Runner:
             if best is None:
                 continue
             decision, strat = best
+            # Risk context as it stood when this market was decided (before we reserve
+            # capital for its own order below) — logged for later reconstruction.
+            par_at_decision = portfolio_at_risk
             # Settlement-station gate: never open real-money risk on a station whose
             # (series -> NWS station) mapping hasn't been validated against resolved
             # markets. A wrong station yields a confident-but-biased p that Kelly
@@ -305,6 +310,13 @@ class Runner:
             self._record_ticket(ticket)
             tickets.append(ticket)
             decisions_log.append(self._log_row(decision, strat, ticket))
+            # Canonical, queryable record of this decision in the DB (the learning
+            # substrate). Best-effort: a logging failure must never abort a cycle.
+            try:
+                self.state.record_decision(self._db_decision_row(
+                    decision, strat, ticket, quote, view, bankroll, par_at_decision))
+            except Exception as e:  # noqa: BLE001
+                print(f"[runner] state.record_decision failed ({e})", flush=True)
 
         self._write_log(decisions_log)
         self._write_status(bankroll, positions)
@@ -366,27 +378,98 @@ class Runner:
             elif status in ("executed", "canceled"):
                 self.state.update_order(coid, status=status, fill_count=fill)
 
-    def _book_settlements(self) -> None:
-        """Book realized P&L for acted-on markets that have since settled (once each)."""
+    def _reconcile_fills(self) -> None:
+        """Pull actual broker fills and persist them as the source of truth for P&L.
+
+        Reads ``GET /portfolio/fills`` (authoritative per-contract entry prices in
+        cents), aggregates by broker ``order_id``, matches each back to one of our
+        recorded orders, and upserts a ``fills`` row (filled count, avg entry price,
+        taker fee). This captures both immediate IOC-taker fills (gone from the order
+        listing before the next cycle) and makers that fill later. Best-effort: a
+        broker hiccup just retries next cycle.
+        """
         from hedge.tournament.paper import taker_fee
-        rows = self._recent_decision_rows()
-        acted: dict[str, dict] = {}
-        for r in rows:
-            acted.setdefault(r["ticker"], r)  # first acted decision per ticker
-        outcomes = self._settlement_outcomes(set(acted))
-        for ticker, r in acted.items():
+        try:
+            fills = (self.client.get_fills(limit=200) or {}).get("fills", []) or []
+        except Exception:  # noqa: BLE001 — endpoint missing/hiccup; retry next cycle
+            return
+        agg: dict[str, dict] = {}
+        for f in fills:
+            oid = f.get("order_id")
+            side = (f.get("side") or "").lower()
+            if not oid or side not in ("yes", "no"):
+                continue
+            n = int(float(f.get("count", 0) or 0))
+            px = f.get("yes_price") if side == "yes" else f.get("no_price")
+            if n <= 0 or px is None:
+                continue
+            px = float(px)  # cents
+            a = agg.setdefault(oid, {"count": 0, "notional": 0.0, "fee": 0.0,
+                                     "side": side, "action": (f.get("action") or "buy").lower()})
+            a["count"] += n
+            a["notional"] += px * n
+            if bool(f.get("is_taker", True)):
+                a["fee"] += taker_fee(px / 100.0) * 100.0 * n  # per-contract $ -> total cents
+        for oid, a in agg.items():
+            row = self.state.order_for_oid(oid)
+            if row is None:
+                continue  # a fill we have no record of placing — leave it to manual review
+            avg = a["notional"] / a["count"] if a["count"] else None
+            try:
+                self.state.record_fill(
+                    row["client_order_id"], row["ticker"], a["side"], a["action"],
+                    a["count"], order_id=oid, avg_price_cents=avg,
+                    fee_cents=a["fee"], status="executed")
+            except Exception as e:  # noqa: BLE001
+                print(f"[runner] record_fill failed for {oid} ({e})", flush=True)
+
+    def _book_settlements(self) -> None:
+        """Book realized P&L from ACTUAL FILLS (not intent) for settled markets.
+
+        For each ticker we have real fills on that has since resolved, P&L is the sum
+        over fills of the filled count at the actual entry price, won/lost by the
+        settlement outcome, net of the recorded taker fee. Booked once per ticker.
+        This is the difference between "we think we made $X" (intended order) and "we
+        made $X" (what actually filled) — the whole point of fill-based accounting.
+        """
+        from hedge.tournament.paper import taker_fee
+        tickers = self.state.unsettled_fill_tickers()
+        if not tickers:
+            return
+        outcomes = self._settlement_outcomes(set(tickers))
+        for ticker in tickers:
             if ticker not in outcomes:
                 continue
-            price = float(r.get("price_cents", 0)) / 100.0
-            count = int(r.get("count", 0) or 0)
-            side = r.get("side")
-            if count <= 0 or side not in ("yes", "no") or not (0.0 < price < 1.0):
+            won_yes = outcomes[ticker]
+            rows = self.state.fills_for_ticker(ticker)
+            total_pnl = 0.0
+            total_count = 0
+            notional_c = 0.0
+            sides: set[str] = set()
+            for r in rows:
+                n = int(r["fill_count"] or 0)
+                if n <= 0 or r["avg_price_cents"] is None:
+                    continue
+                price = float(r["avg_price_cents"]) / 100.0
+                if not (0.0 < price < 1.0):
+                    continue
+                side = r["side"]
+                sides.add(side)
+                won = won_yes if side == "yes" else (not won_yes)
+                gross = n * (1.0 - price) if won else -n * price
+                fee = (float(r["fee_cents"]) / 100.0) if r["fee_cents"] is not None \
+                    else taker_fee(price) * n
+                total_pnl += gross - fee
+                total_count += n
+                notional_c += float(r["avg_price_cents"]) * n
+            if total_count <= 0:
                 continue
-            won = outcomes[ticker] if side == "yes" else (not outcomes[ticker])
-            fee = taker_fee(price)
-            pnl_per = (1 - price - fee) if won else (-price - fee)
             try:
-                self.state.book_settlement(ticker, pnl_per * count)
+                self.state.book_settlement(
+                    ticker, total_pnl,
+                    side=(next(iter(sides)) if len(sides) == 1 else "mixed"),
+                    entry_cents=notional_c / total_count, count=total_count,
+                    outcome="yes" if won_yes else "no")
             except Exception as e:  # noqa: BLE001
                 print(f"[runner] book_settlement failed for {ticker} ({e})", flush=True)
 
@@ -451,6 +534,10 @@ class Runner:
             d = decide(sig, quote, bankroll, self.cfg,
                        position=position, portfolio_at_risk=portfolio_at_risk)
             d.meta["strategy"] = sig.strategy
+            # Carry the model's own inputs (forecast, dispersion, bias, max-so-far)
+            # so a decision row records *why* the prob was what it was.
+            if sig.meta:
+                d.meta["signal"] = dict(sig.meta)
             if d.is_trade:
                 if best_trade is None or d.edge > best_trade[0].edge:
                     best_trade = (d, sig.strategy)
@@ -470,6 +557,39 @@ class Runner:
         prevented by the anti-stack guard + position reconciliation, not the key."""
         day = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
         return f"{day}:{getattr(self, '_cycle_seq', 0)}"
+
+    def _db_decision_row(self, decision: Decision, strat: str, ticket: OrderTicket,
+                         quote, view, bankroll: float, portfolio_at_risk: float) -> dict:
+        """Build a full ``decisions`` row: belief + market snapshot + intended order."""
+        now = datetime.now(ZoneInfo("UTC"))
+        body = ticket.body or {}
+        return {
+            "cycle_seq": getattr(self, "_cycle_seq", 0),
+            "ts": now.isoformat(),
+            "utc_date": now.strftime("%Y-%m-%d"),
+            "ticker": decision.ticker,
+            "strategy": strat,
+            "action": decision.action.value,
+            "side": decision.side.value if decision.side else None,
+            "count": decision.count,
+            "price_cents": decision.price_cents,
+            "prob": decision.prob,
+            "sigma": decision.sigma,
+            "edge": decision.edge,
+            "kelly_fraction": decision.kelly_fraction,
+            "yes_bid": quote.yes_bid,
+            "yes_ask": quote.yes_ask,
+            "mid": quote.mid,
+            "last": getattr(view, "last_price", None),
+            "bankroll": round(bankroll, 4),
+            "portfolio_at_risk": round(portfolio_at_risk, 4),
+            "placed": int(bool(ticket.placed)),
+            "dry_run": int(bool(ticket.dry_run)),
+            "error": ticket.error,
+            "reason": decision.reason,
+            "client_order_id": body.get("client_order_id"),
+            "meta_json": json.dumps(dict(decision.meta), default=str),
+        }
 
     @staticmethod
     def _log_row(decision: Decision, strat: str, ticket: OrderTicket) -> dict:
