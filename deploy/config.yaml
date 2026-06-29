@@ -1,0 +1,33 @@
+# Secrets-FREE deploy config, baked into the container image as /app/config.yaml.
+#
+# Kalshi credentials are deliberately NOT here — they arrive as Fly secrets (env):
+#   KALSHI_KEY_ID, KALSHI_PRIVATE_KEY, KALSHI_ENV  (env vars override this file).
+# Alert channel arrives as the HEDGE_ALERT_URL secret.
+#
+# This file exists so the conservative risk envelope and kill-switch ALWAYS apply in
+# the container. Without it, the bot would fall back to library defaults (λ=0.25, no
+# absolute $ cap, no daily-loss stop) — which is how a one-cent market becomes a
+# 7,500-contract order. The caps below are the agreed go-live envelope.
+
+kalshi:
+  env: demo            # overridden by the KALSHI_ENV secret at deploy time
+
+risk:
+  lambda_kelly: 0.10        # conservative fractional Kelly
+  k_sigma: 2.0
+  z_ci: 1.0
+  tau_min_cents: 2
+  market_cap_frac: 0.03
+  portfolio_cap: 0.30
+  rebalance_band: 0.25
+  max_order_dollars: 25.0   # hard per-order ceiling
+  daily_loss_stop_dollars: 50.0   # latch a halt for the UTC day past this loss
+
+guard:
+  enabled: true
+  min_samples: 20
+  max_brier: 0.25
+  baseline_brier: 0.15      # binary acted-on Brier; trips at 0.20
+  tolerance: 0.05
+  window_days: 14
+  flatten_on_trip: false
