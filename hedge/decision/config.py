@@ -21,6 +21,16 @@ class RiskConfig:
     portfolio_cap: float = 0.30     # max total bankroll fraction at risk
     rebalance_band: float = 0.25    # only rebalance if target drifts > this frac
 
+    # Tradeable-price band: refuse to OPEN a position whose execution price falls
+    # outside [min_price, max_price] (dollars). Extreme contracts are where the
+    # model is least calibrated (tail estimation), where fees are the largest
+    # fraction of price, and — critically — where there is no bid to exit into, so
+    # a losing penny contract can only ride to 0. Keeps the engine out of 1-9c
+    # long-shot junk (and the rich-side mirror). Gates opens only; an existing
+    # holding can still be trimmed/closed outside the band.
+    min_price: float = 0.10
+    max_price: float = 0.90
+
     # Intraday position management (trim / add / flip-to-exit existing holdings).
     # OFF by default. When True the engine reconciles live positions (trim/add/flip);
     # realized P&L from intraday closes is booked into the daily-loss stop and an

@@ -174,3 +174,28 @@ def test_no_market_quote_no_trade_on_zero_bankroll():
     q = MarketQuote(yes_bid=0.53, yes_ask=0.55)
     d = decide(_sig(0.70), q, 0.0, RISK)
     assert d.action is Action.HOLD
+
+
+def test_price_band_blocks_cheap_long_shot_open():
+    # Model loves a 5c YES contract (thinks it's worth 30c) — a huge edge, but it's
+    # a tail bet with no exit liquidity. The default 0.10 floor must refuse to open.
+    q = MarketQuote(yes_bid=0.04, yes_ask=0.05)
+    d = decide(_sig(0.30, se=0.01), q, BANKROLL, RISK)
+    assert d.action is Action.HOLD and d.count == 0
+    assert "tradeable band" in d.reason
+
+
+def test_price_band_blocks_rich_side_open():
+    # Mirror: buying YES at 0.95 for a sliver of edge is just as fee-heavy / pinned.
+    q = MarketQuote(yes_bid=0.95, yes_ask=0.96)
+    d = decide(_sig(0.999, se=0.001), q, BANKROLL, RISK)
+    assert d.action is Action.HOLD and d.count == 0
+    assert "tradeable band" in d.reason
+
+
+def test_price_band_lowering_floor_lets_cheap_open_through():
+    # The band is configurable: drop the floor and the same cheap edge trades.
+    q = MarketQuote(yes_bid=0.04, yes_ask=0.05)
+    cfg = RiskConfig(lambda_kelly=0.25, k_sigma=2.0, tau_min_cents=2.0, min_price=0.01)
+    d = decide(_sig(0.30, se=0.01), q, BANKROLL, cfg)
+    assert d.action is Action.BUY and d.side is Side.YES and d.count > 0

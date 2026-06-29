@@ -20,8 +20,18 @@ risk:
   market_cap_frac: 0.03
   portfolio_cap: 0.30
   rebalance_band: 0.25
+  min_price: 0.10           # don't open below 10c: tail bets, no exit liquidity
+  max_price: 0.90           # rich-side mirror
   max_order_dollars: 25.0   # hard per-order ceiling
-  daily_loss_stop_dollars: 50.0   # latch a halt for the UTC day past this loss
+  daily_loss_stop_dollars: 15.0   # latch a halt for the UTC day past this loss.
+                                   # Tightened from 50 now that the stop actually
+                                   # SEES intraday-close losses (the fix) — 50 was
+                                   # ~all of a ~$50 bankroll, i.e. no real protection.
+  manage_positions: true    # intraday trim/add/flip-to-exit (blockers fixed: intraday
+                            # P&L booked to the daily stop, anti-churn cooldown, guard
+                            # samples buys only). Edge still unproven — paper loop runs
+                            # alongside to gather realized P&L evidence.
+  manage_cooldown_cycles: 2 # don't re-act on a managed ticker for 2 cycles (anti-churn)
 
 guard:
   enabled: true

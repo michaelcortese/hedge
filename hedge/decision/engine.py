@@ -264,6 +264,18 @@ def decide(
             **base,
         )
 
+    # (5b) Tradeable-price band: don't OPEN in the extreme tails. Cheap contracts
+    # we'd buy are long-shot tail bets — worst-calibrated, fee-heavy, and with no
+    # bid to exit into (they can only ride to 0). The rich side mirrors this. Gates
+    # opens only; _reconcile may still trim/close an existing holding below the band.
+    if not (cfg.min_price <= exec_price <= cfg.max_price):
+        return _hold(
+            ticker,
+            f"exec price {exec_price:.2f} outside tradeable band "
+            f"[{cfg.min_price:.2f}, {cfg.max_price:.2f}]",
+            **base,
+        )
+
     # (6) Size on a CONSERVATIVE edge: shade the win prob down by z_ci*sigma, then
     # net fees at the chosen price. This stacks a CI haircut on top of fractional
     # Kelly so a noisy signal is bet smaller (or not at all).

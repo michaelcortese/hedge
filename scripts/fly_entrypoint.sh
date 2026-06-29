@@ -16,10 +16,19 @@ set -eu
 
 INTERVAL="${HEDGE_INTERVAL:-1800}"
 
-echo "[entrypoint] starting dry-run reconciler (background) + paper loop (foreground), interval=${INTERVAL}s"
+# Real-money arming switch. Default OFF (dry-run): the reconciler books settlements
+# and PREVIEWS management decisions but places no orders. Arm with no code change by
+# setting the HEDGE_LIVE secret to 1:  fly secrets set HEDGE_LIVE=1 && fly deploy
+LIVE=""
+case "${HEDGE_LIVE:-0}" in
+  1|true|TRUE|yes|on) LIVE="--live" ;;
+esac
 
-# Background: dry-run reconcile + settlement booking on existing real positions.
-python -m hedge.runner --interval "$INTERVAL" --allow-prod &
+echo "[entrypoint] reconciler=${LIVE:-dry-run} + paper loop, interval=${INTERVAL}s"
+
+# Background: reconcile + settlement booking (+ management preview/execution if armed).
+# shellcheck disable=SC2086
+python -m hedge.runner $LIVE --interval "$INTERVAL" --allow-prod &
 RECONCILER_PID=$!
 
 # If this script is told to stop, pass it on to the background reconciler too.
