@@ -131,6 +131,23 @@ def test_runner_trips_and_latches(tmp_path, monkeypatch):
     assert runner.is_halted()[0] is False
 
 
+def test_sells_excluded_from_guard_sample(tmp_path, monkeypatch):
+    # Fix #4: the same 30 confidently-wrong rows that trip the guard as BUYs must NOT
+    # trip it as SELLs — a flip-to-exit carries the opposite belief and is not an entry
+    # calibration sample. With sells excluded the sample is empty -> no trip.
+    rows = [{"ticker": f"KX-T{i}", "prob": 0.9, "action": "sell",
+             "ts": "2026-06-20T00:00:00+00:00"} for i in range(30)]
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "decisions_2026-06-20.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n")
+    results = {f"KX-T{i}": "no" for i in range(30)}  # would be maximally wrong AS ENTRIES
+
+    client = _FakeClient(results=results)
+    runner = _runner(tmp_path, monkeypatch, client, GuardConfig(min_samples=10, max_brier=0.25))
+    runner.run_cycle()
+    assert runner.is_halted()[0] is False            # sells didn't corrupt the Brier
+
+
 def test_runner_trades_when_calibrated(tmp_path, monkeypatch):
     # Well-calibrated history -> guard passes -> normal trading proceeds (dry-run).
     rows = [{"ticker": f"KX-T{i}", "prob": 0.9, "action": "buy",

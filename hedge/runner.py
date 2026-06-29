@@ -152,6 +152,18 @@ class Runner:
                 extra.append(MarketView(raw.get("ticker", ticker), raw))
         return extra
 
+    # ----- anti-churn cooldown (per managed ticker) --------------------------
+    def _manage_cooldown_active(self, ticker: str) -> bool:
+        """True if we managed ``ticker`` within the last cfg.manage_cooldown_cycles."""
+        last = self.state.get_meta(f"mgmt_cycle:{ticker}")
+        if last is None:
+            return False
+        return (getattr(self, "_cycle_seq", 0) - int(last)) < self.cfg.manage_cooldown_cycles
+
+    def _mark_manage(self, ticker: str) -> None:
+        """Stamp the current cycle as the last time we managed ``ticker``."""
+        self.state.set_meta(f"mgmt_cycle:{ticker}", str(getattr(self, "_cycle_seq", 0)))
+
     def market_views(self) -> list[MarketView]:
         views: list[MarketView] = []
         for series in STATIONS:
@@ -194,7 +206,13 @@ class Runner:
             self._flatten()
 
     def _recent_decision_rows(self) -> list[dict]:
-        """Read acted-on (non-hold) decisions from the last window_days logs."""
+        """Read acted-on opening (BUY) decisions from the last window_days logs.
+
+        Only BUYs feed the calibration kill-switch: the guard scores the Brier of our
+        *entry* beliefs against outcomes. A SELL-to-exit carries the new, opposite belief
+        that triggered the flip — scoring it would penalize a correct de-risking as if it
+        were a miscalibrated entry and could falsely trip the latch. So sells are excluded.
+        """
         if not LIVE_DIR.exists():
             return []
         rows: list[dict] = []
@@ -206,7 +224,7 @@ class Runner:
                     r = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if r.get("action") in ("buy", "sell") and r.get("prob") is not None:
+                if r.get("action") == "buy" and r.get("prob") is not None:
                     rows.append(r)
         return rows
 
@@ -267,10 +285,12 @@ class Runner:
         seq = self.state.next_cycle_seq()
         self._cycle_seq = seq   # client_order_ids are keyed on this (idempotency)
         # Reconcile our orders against broker truth (fills/cancels; cancel-replace
-        # stale resting makers), pull actual fill economics, and book any
-        # newly-settled realized P&L from those fills.
+        # stale resting makers), pull actual fill economics, book realized P&L from
+        # intraday closes (so the daily-loss stop sees churn), then book any
+        # newly-settled realized P&L on the net held position.
         self._reconcile_orders()
         self._reconcile_fills()
+        self._book_intraday_realized()
         self._book_settlements()
 
         # Circuit breaker first: never trade past a tripped/halted guard.
@@ -328,6 +348,19 @@ class Runner:
             # Risk context as it stood when this market was decided (before we reserve
             # capital for its own order below) — logged for later reconstruction.
             par_at_decision = portfolio_at_risk
+            # Anti-churn cooldown: on a ticker we already HOLD and just managed, don't
+            # act again for cfg.manage_cooldown_cycles cycles. Stops a noisy boundary
+            # from sell->rebuy->sell flip-flopping (fee bleed) and a duplicate exit from
+            # being re-sent before the close lands in positions(). Never gates a fresh
+            # open (a ticker we don't hold).
+            if (decision.is_trade and self.cfg.manage_positions
+                    and view.ticker in positions and self._manage_cooldown_active(view.ticker)):
+                decision = Decision(
+                    ticker=decision.ticker, action=Action.HOLD,
+                    prob=decision.prob, sigma=decision.sigma,
+                    reason=f"manage cooldown active ({self.cfg.manage_cooldown_cycles} cyc)",
+                )
+                decision.meta["strategy"] = strat
             # Settlement-station gate: never OPEN/ADD real-money risk on a station whose
             # (series -> NWS station) mapping hasn't been validated against resolved
             # markets. A wrong station yields a confident-but-biased p that Kelly
@@ -361,6 +394,10 @@ class Runner:
                 decision, idem_key=self._idem_key(decision),
             )
             self._record_ticket(ticket)
+            # Start the anti-churn cooldown when we actually act on a held position.
+            if (ticket.placed and decision.is_trade and self.cfg.manage_positions
+                    and view.ticker in positions):
+                self._mark_manage(view.ticker)
             tickets.append(ticket)
             decisions_log.append(self._log_row(decision, strat, ticket))
             # Canonical, queryable record of this decision in the DB (the learning
@@ -505,23 +542,40 @@ class Runner:
                 continue
             avg = a["notional"] / a["count"] if a["count"] else None
             try:
+                # Use OUR order's side/action (buy=open, sell=close) — the broker's
+                # fill action/side are YES-centric and can't tell an open from a close.
+                # This is what lets position_accounting realize close P&L correctly.
                 self.state.record_fill(
-                    row["client_order_id"], row["ticker"], a["side"], a["action"],
+                    row["client_order_id"], row["ticker"], row["side"], row["action"],
                     count, order_id=oid, avg_price_cents=avg,
                     fee_cents=a["fee"], status="executed")
             except Exception as e:  # noqa: BLE001
                 print(f"[runner] record_fill failed for {oid} ({e})", flush=True)
 
-    def _book_settlements(self) -> None:
-        """Book realized P&L from ACTUAL FILLS (not intent) for settled markets.
+    def _book_intraday_realized(self) -> None:
+        """Book realized P&L from intraday CLOSES so the daily-loss stop sees churn.
 
-        For each ticker we have real fills on that has since resolved, P&L is the sum
-        over fills of the filled count at the actual entry price, won/lost by the
-        settlement outcome, net of the recorded taker fee. Booked once per ticker.
-        This is the difference between "we think we made $X" (intended order) and "we
-        made $X" (what actually filled) — the whole point of fill-based accounting.
+        Each cycle, for every ticker we hold fills on, book the increment in realized-
+        from-closes P&L (sells that reduced a position before settlement). Without this,
+        a flip-to-exit loss was invisible to ``realized_today()`` until settlement and
+        the daily-loss stop could be drained by churn it never saw. Best-effort.
         """
-        from hedge.tournament.paper import taker_fee
+        for ticker in self.state.unsettled_fill_tickers():
+            try:
+                self.state.book_intraday_realized(ticker)
+            except Exception as e:  # noqa: BLE001
+                print(f"[runner] book_intraday_realized failed for {ticker} ({e})", flush=True)
+
+    def _book_settlements(self) -> None:
+        """Book settlement P&L on the NET held position for settled markets.
+
+        Uses average-cost accounting (``state.position_accounting``): the realized P&L
+        from intraday closes is booked separately by :meth:`_book_intraday_realized`, so
+        here we book ONLY the net-held-to-settlement quantity per side — won/lost by the
+        outcome at the average entry cost, minus the open-side fees. Booking gross fills
+        (the prior behavior) would double-count any position that was sold intraday.
+        Booked once per ticker via the ``settled`` table.
+        """
         tickers = self.state.unsettled_fill_tickers()
         if not tickers:
             return
@@ -530,35 +584,25 @@ class Runner:
             if ticker not in outcomes:
                 continue
             won_yes = outcomes[ticker]
-            rows = self.state.fills_for_ticker(ticker)
-            total_pnl = 0.0
-            total_count = 0
-            notional_c = 0.0
-            sides: set[str] = set()
-            for r in rows:
-                n = int(r["fill_count"] or 0)
-                if n <= 0 or r["avg_price_cents"] is None:
+            acct = self.state.position_accounting(ticker)
+            pnl = -acct["buy_fees"]                      # open-side fees charged here
+            net_total = 0
+            entry_c = 0.0
+            held_side = None
+            for side, net in acct["net"].items():
+                if net <= 0:
                     continue
-                price = float(r["avg_price_cents"]) / 100.0
-                if not (0.0 < price < 1.0):
-                    continue
-                side = r["side"]
-                sides.add(side)
+                avg = acct["avg_cost_cents"][side] / 100.0
                 won = won_yes if side == "yes" else (not won_yes)
-                gross = n * (1.0 - price) if won else -n * price
-                fee = (float(r["fee_cents"]) / 100.0) if r["fee_cents"] is not None \
-                    else taker_fee(price) * n
-                total_pnl += gross - fee
-                total_count += n
-                notional_c += float(r["avg_price_cents"]) * n
-            if total_count <= 0:
-                continue
+                pnl += net * (1.0 - avg) if won else -net * avg
+                net_total += net
+                entry_c += acct["avg_cost_cents"][side] * net
+                held_side = side if held_side is None else "mixed"
             try:
                 self.state.book_settlement(
-                    ticker, total_pnl,
-                    side=(next(iter(sides)) if len(sides) == 1 else "mixed"),
-                    entry_cents=notional_c / total_count, count=total_count,
-                    outcome="yes" if won_yes else "no")
+                    ticker, pnl, side=held_side,
+                    entry_cents=(entry_c / net_total) if net_total else None,
+                    count=net_total, outcome="yes" if won_yes else "no")
             except Exception as e:  # noqa: BLE001
                 print(f"[runner] book_settlement failed for {ticker} ({e})", flush=True)
 

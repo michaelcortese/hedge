@@ -22,14 +22,19 @@ class RiskConfig:
     rebalance_band: float = 0.25    # only rebalance if target drifts > this frac
 
     # Intraday position management (trim / add / flip-to-exit existing holdings).
-    # OFF by default and deliberately so: turning it on activates the engine's
-    # reconcile path against live positions, which a review found has open blockers
-    # — intraday SELL P&L is not booked into the daily-loss stop, and there is no
-    # anti-churn cooldown, so a noisy day can flip-flop a position and bleed fees
-    # invisibly. Keep False until those are fixed AND the strategy's edge is proven
-    # on realized, market-priced, fee-net P&L. When False the runner only OPENS new
-    # positions (and reads holdings for the portfolio cap); it never trims/flips.
+    # OFF by default. When True the engine reconciles live positions (trim/add/flip);
+    # realized P&L from intraday closes is booked into the daily-loss stop and an
+    # anti-churn cooldown (below) damps flip-flop. Enable only once the strategy's edge
+    # is proven on realized, market-priced, fee-net P&L. When False the runner only
+    # OPENS new positions (and reads holdings for the portfolio cap); never trims/flips.
     manage_positions: bool = False
+
+    # Anti-churn: after a management trade (trim/add/flip-to-exit) on a ticker, do not
+    # act on that ticker again for this many cycles. Prevents a noisy signal from
+    # sell->rebuy->sell flip-flopping around a boundary and bleeding taker fees, and
+    # stops a duplicate exit being re-sent before the close shows up in positions().
+    # Only applies to managed (existing-position) tickers, never to a fresh open.
+    manage_cooldown_cycles: int = 2
 
     # Hard absolute ceiling on dollars-at-risk per order (None = no absolute cap,
     # fractions still apply). A backstop for early live trading so a mis-read

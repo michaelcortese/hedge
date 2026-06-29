@@ -332,6 +332,51 @@ def test_settlement_ignores_unfilled_intent(monkeypatch, tmp_path):
     assert r.state.realized_today() == 0.0
 
 
+def test_intraday_close_loss_hits_daily_pnl_before_settlement(monkeypatch, tmp_path):
+    # The blocker fix: an intraday SELL at a loss must be visible to realized_today()
+    # (hence the daily-loss stop) BEFORE the market settles — not invisible until then.
+    t = "KXHIGHCHI-26JUN29-T80"
+    client = _RunnerClient()           # market NOT settled (no result)
+    r = _runner(client, tmp_path, monkeypatch, t, cfg=_MANAGE)
+    # Bought 10 NO @ 50c, then closed 10 NO @ 40c intraday -> realized -$1.00 (+fees 0).
+    r.state.record_fill("open-1", t, "no", "buy", 10, order_id="O1",
+                        avg_price_cents=50.0, fee_cents=0.0, status="executed")
+    r.state.record_fill("close-1", t, "no", "sell", 10, order_id="O2",
+                        avg_price_cents=40.0, fee_cents=0.0, status="executed")
+    r.run_cycle()
+    assert abs(r.state.realized_today() - (-1.00)) < 1e-6   # seen pre-settlement
+
+
+def test_intraday_close_then_settlement_not_double_counted(monkeypatch, tmp_path):
+    # Open 10 NO @ 50c, close 4 NO @ 60c intraday (realized +$0.40), hold 6 NO to
+    # settlement where NO wins (6 * (1 - 0.50) = +$3.00). Total must be +$3.40 — the
+    # intraday close is booked once and settlement books only the net-held 6, not all 10.
+    t = "KXHIGHCHI-26JUN29-T80"
+    client = _RunnerClient()
+    client.results[t] = "no"           # NO wins
+    r = _runner(client, tmp_path, monkeypatch, t, cfg=_MANAGE)
+    r.state.record_fill("open-1", t, "no", "buy", 10, order_id="O1",
+                        avg_price_cents=50.0, fee_cents=0.0, status="executed")
+    r.state.record_fill("close-1", t, "no", "sell", 4, order_id="O2",
+                        avg_price_cents=60.0, fee_cents=0.0, status="executed")
+    r.run_cycle()
+    assert abs(r.state.realized_today() - 3.40) < 1e-6
+
+
+def test_manage_cooldown_blocks_repeat_exit_next_cycle(monkeypatch, tmp_path):
+    # The churn fix: after a flip-to-exit SELL fills on a held ticker, the next cycle
+    # must NOT re-issue another SELL while the cooldown is active (no sell-rebuy-sell).
+    t = "KXHIGHCHI-26JUN29-T80"
+    client = _RunnerClient()
+    client.positions_payload = [
+        {"ticker": t, "position_fp": "-4.00", "market_exposure_dollars": "1.80"}]
+    r = _runner(client, tmp_path, monkeypatch, t, cfg=_MANAGE)
+    r.run_cycle()
+    assert len(client.orders) == 1 and r.state.get_meta(f"mgmt_cycle:{t}")  # exited + stamped
+    r.run_cycle()                                  # cooldown active (cycles 1->2 < 2)
+    assert len(client.orders) == 1                 # no duplicate exit
+
+
 def test_reconcile_fills_records_broker_fill(monkeypatch, tmp_path):
     t = "KXHIGHCHI-26JUN29-T80"
     client = _RunnerClient()

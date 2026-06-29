@@ -143,6 +143,15 @@ class State:
                 ts              TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_fills_ticker ON fills(ticker);
+            -- Per-ticker realized P&L ALREADY booked from intraday CLOSES (sells that
+            -- reduce a position before settlement). We book the delta each cycle so the
+            -- daily-loss stop sees churn losses immediately; this row is the high-water
+            -- mark so we never double-book the same realized close.
+            CREATE TABLE IF NOT EXISTS realized_close (
+                ticker  TEXT PRIMARY KEY,
+                booked  REAL NOT NULL DEFAULT 0,
+                ts      TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -281,15 +290,104 @@ class State:
             "AND ticker NOT IN (SELECT ticker FROM settled)").fetchall()
         return [r["ticker"] for r in rows]
 
+    # ----- position P&L accounting (average-cost, open/close aware) -----------
+    def position_accounting(self, ticker: str) -> dict:
+        """Average-cost P&L decomposition for one ticker from recorded fills.
+
+        Opens are ``action='buy'`` fills, closes are ``action='sell'`` fills — and that
+        action is OUR order intent (set in ``_reconcile_fills`` from the matched order),
+        NOT the broker's YES-centric fill ``action``. Per side it computes the held net
+        (bought − sold), the average entry cost (cents), the realized P&L locked in by
+        intraday closes (dollars, net of the SELL fees), and the open-side BUY fees
+        (charged at settlement). Returns::
+
+            {"intraday_realized": $, "net": {side: contracts},
+             "avg_cost_cents": {side: ¢}, "buy_fees": $}
+
+        A side with sells but no buys (cost basis unknown — e.g. a pre-tracking
+        position) is skipped from realized so we never book phantom profit.
+        """
+        agg: dict[str, dict] = {}
+        for r in self.fills_for_ticker(ticker):
+            n = int(r["fill_count"] or 0)
+            if n <= 0 or r["avg_price_cents"] is None:
+                continue
+            s = r["side"]
+            d = agg.setdefault(s, {"bought": 0, "bought_notional": 0.0, "sold": 0,
+                                   "sold_notional": 0.0, "buy_fee": 0.0, "sell_fee": 0.0})
+            px = float(r["avg_price_cents"])
+            fee = float(r["fee_cents"] or 0.0) / 100.0
+            if (r["action"] or "buy") == "sell":           # a CLOSE
+                d["sold"] += n
+                d["sold_notional"] += px * n
+                d["sell_fee"] += fee
+            else:                                          # an OPEN
+                d["bought"] += n
+                d["bought_notional"] += px * n
+                d["buy_fee"] += fee
+        intraday = 0.0
+        net: dict[str, int] = {}
+        avg_cost: dict[str, float] = {}
+        buy_fees = 0.0
+        for s, d in agg.items():
+            if d["bought"] <= 0:
+                continue  # can't price a close with no recorded open; skip (no phantom P&L)
+            avg = d["bought_notional"] / d["bought"]
+            avg_cost[s] = avg
+            net[s] = d["bought"] - d["sold"]
+            # Realized from closes (dollars): cash received minus cost basis of the
+            # sold units, net of the sell fees. Buy fees are charged at settlement.
+            intraday += (d["sold_notional"] - d["sold"] * avg) / 100.0 - d["sell_fee"]
+            buy_fees += d["buy_fee"]
+        return {"intraday_realized": intraday, "net": net,
+                "avg_cost_cents": avg_cost, "buy_fees": buy_fees}
+
     # ----- daily P&L (for the daily-loss stop + heartbeat) -------------------
+    def _add_daily(self, day: str, amount: float) -> None:
+        """Accumulate realized P&L (dollars) into the daily_pnl row for ``day``."""
+        self.conn.execute(
+            """INSERT INTO daily_pnl (utc_date, realized, fees, updated_ts)
+               VALUES (?,?,0,?)
+               ON CONFLICT(utc_date) DO UPDATE SET
+                 realized = daily_pnl.realized + excluded.realized,
+                 updated_ts = excluded.updated_ts""",
+            (day, float(amount), _now_iso()),
+        )
+
+    def book_intraday_realized(self, ticker: str, *, utc_date: str | None = None) -> float:
+        """Book the realized P&L locked in by intraday CLOSES of ``ticker`` since last
+        cycle, so the daily-loss stop sees churn immediately. Returns the delta booked.
+
+        Idempotent by a per-ticker high-water mark (``realized_close``): we recompute
+        the total realized-from-closes each cycle and book only the increment. This is
+        the fix that made intraday sell losses visible to the daily-loss stop (they were
+        previously booked only at settlement, leaving the stop blind to a day of churn).
+        """
+        total = self.position_accounting(ticker)["intraday_realized"]
+        row = self.conn.execute(
+            "SELECT booked FROM realized_close WHERE ticker=?", (ticker,)).fetchone()
+        booked = float(row["booked"]) if row else 0.0
+        delta = total - booked
+        if abs(delta) < 1e-9:
+            return 0.0
+        day = utc_date or _now_iso()[:10]
+        self._add_daily(day, delta)
+        self.conn.execute(
+            "INSERT INTO realized_close (ticker, booked, ts) VALUES (?,?,?) "
+            "ON CONFLICT(ticker) DO UPDATE SET booked=excluded.booked, ts=excluded.ts",
+            (ticker, total, _now_iso()))
+        self.conn.commit()
+        return delta
+
     def book_settlement(self, ticker: str, pnl: float, *, utc_date: str | None = None,
                         side: str | None = None, entry_cents: float | None = None,
                         count: int | None = None, outcome: str | None = None) -> bool:
         """Record a settled market's realized P&L once. Returns False if already booked.
 
         Accumulates into ``daily_pnl`` for the settlement's UTC day so the daily-loss
-        stop sees it. Idempotent per ticker via the ``settled`` table. The optional
-        side/entry/count/outcome make the row a complete trade record for review.
+        stop sees it. Idempotent per ticker via the ``settled`` table. ``pnl`` should be
+        the NET-held-to-settlement P&L only — realized P&L from intraday closes is booked
+        separately via :meth:`book_intraday_realized`, so settlement must not re-book it.
         """
         if self.conn.execute("SELECT 1 FROM settled WHERE ticker=?", (ticker,)).fetchone():
             return False
@@ -299,14 +397,7 @@ class State:
             "VALUES (?,?,?,?,?,?,?,?)",
             (ticker, day, float(pnl), _now_iso(), side, entry_cents,
              int(count) if count is not None else None, outcome))
-        self.conn.execute(
-            """INSERT INTO daily_pnl (utc_date, realized, fees, updated_ts)
-               VALUES (?,?,0,?)
-               ON CONFLICT(utc_date) DO UPDATE SET
-                 realized = daily_pnl.realized + excluded.realized,
-                 updated_ts = excluded.updated_ts""",
-            (day, float(pnl), _now_iso()),
-        )
+        self._add_daily(day, float(pnl))
         self.conn.commit()
         return True
 
