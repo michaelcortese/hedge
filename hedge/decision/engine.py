@@ -30,6 +30,7 @@ from typing import Any
 
 from hedge.decision.config import RiskConfig
 from hedge.decision.edge import net_edge
+from hedge.decision.fees import fee_per_contract
 from hedge.decision.sizing import kelly_fraction_from_edge
 from hedge.signal import Signal
 
@@ -206,6 +207,51 @@ def _net_edge_at(win_prob: float, price: float, *, maker: bool, cfg: RiskConfig)
     return net_edge(win_prob, price, maker=maker, coef=coef)
 
 
+def _exit_check(
+    ticker: str, p: float, sigma: float, quote: MarketQuote,
+    position: Position, cfg: RiskConfig,
+) -> Decision | None:
+    """Risk-reducing exit: close a held position when the book is *overpaying* for it.
+
+    The SELL-side mirror of the obs-lag thesis. A slow book still bidding a souring
+    contract above its model fair value is free money to hand back, so close to the
+    bid. Three properties keep this from being a money-loser (and distinguish it from
+    a naive stop-loss, which is rejected — see TASKS.md):
+
+    * It runs BEFORE the open-only gates (band / significance / λ-floor). Those govern
+      *opening* risk; they must not block *reducing* it. (The old flip-to-close path was
+      blocked because the band gate evaluated the opposite-side BUY and fired first.)
+    * It is NOT Kelly/λ-scaled — it sells the whole lot. Reducing risk, not sizing it.
+    * It KEEPS a net-edge check: sell only when the held side's bid, net the taker fee,
+      beats holding to (free) settlement by ``tau_exit``. So it never sells a position
+      the model still rates +EV (the "+EV-sale trap"), and the margin damps churn.
+
+    No bid to sell into => the loss (if any) is already locked => no-op.
+    Returns a SELL ``Decision`` to close, or None to fall through to the open pipeline.
+    """
+    if position is None or position.count <= 0:
+        return None
+    held = position.side
+    held_bid = quote.yes_bid if held is Side.YES else quote.no_bid
+    if not _tradeable(held_bid):
+        return None  # no bid: nothing to capture; holding to settlement is the only path
+    # Holding to settlement pays $1 with prob = the model's fair value for the held side
+    # (no exit fee). Selling now nets held_bid minus the taker fee we'd cross to pay.
+    fair = p if held is Side.YES else 1.0 - p
+    fee = fee_per_contract(held_bid, maker=False, coef=cfg.taker_fee_coef)
+    exit_edge = held_bid - fee - fair
+    if exit_edge < cfg.tau_exit:
+        return None  # market isn't overpaying enough; holding is >= selling here
+    return Decision(
+        ticker=ticker, action=Action.SELL, side=held,
+        price=held_bid, price_cents=_to_cents(held_bid),
+        count=position.count, maker=False,
+        edge=exit_edge, prob=p, sigma=sigma,
+        reason=(f"exit: {held.value} bid {held_bid:.2f} over fair {fair:.2f} "
+                f"by {exit_edge:.3f} >= tau_exit {cfg.tau_exit:.2f}"),
+    )
+
+
 def decide(
     signal: Signal,
     quote: MarketQuote,
@@ -250,6 +296,16 @@ def decide(
     p, sigma = _shrink(p, sigma, mid, cfg)
 
     base = dict(prob=p, sigma=sigma)
+
+    # (2b) Risk-reducing exit. Closing a souring position must NOT be gated by the
+    # open-only band / significance / λ-floor checks below, so it runs first — but only
+    # when the exit leg is explicitly armed and we actually hold this market. Reducing
+    # exposure is always allowed; opening it is what the gates govern. See _exit_check.
+    # (exit_leg is a dedicated switch, off by default, pending paper validation.)
+    if cfg.exit_leg and position is not None:
+        exit_decision = _exit_check(ticker, p, sigma, quote, position, cfg)
+        if exit_decision is not None:
+            return exit_decision
 
     # (3) Side selection by net taker edge (the realistically executable edge).
     # A side is only considered when its taker exec price is genuinely tradeable;

@@ -199,3 +199,51 @@ def test_price_band_lowering_floor_lets_cheap_open_through():
     cfg = RiskConfig(lambda_kelly=0.25, k_sigma=2.0, tau_min_cents=2.0, min_price=0.01)
     d = decide(_sig(0.30, se=0.01), q, BANKROLL, cfg)
     assert d.action is Action.BUY and d.side is Side.YES and d.count > 0
+
+
+# ----- risk-reducing exit leg (manage_positions) ----------------------------
+# Closing a souring position must run AHEAD of the open-only gates and is allowed
+# even where a flip-to-open would be blocked by the price band. See engine._exit_check.
+RISK_MANAGE = RiskConfig(lambda_kelly=0.25, k_sigma=2.0, tau_min_cents=2.0,
+                         tau_exit_cents=2.0, manage_positions=True, exit_leg=True)
+
+
+def test_exit_sells_when_book_overpays_held_side_in_band_tail():
+    # We hold NO; the book bids 0.93 for it while the model rates NO worth only 0.20.
+    # The flip-to-YES that would normally close is blocked (YES ask 0.07 is below the
+    # 0.10 band), so the ONLY way out is the exit leg. It should fire and sell the lot.
+    q = MarketQuote(yes_bid=0.06, yes_ask=0.07)        # no_bid = 1-0.07 = 0.93
+    pos = Position(side=Side.NO, count=10, avg_price=0.50)
+    d = decide(_sig(0.80, se=0.01), q, BANKROLL, RISK_MANAGE, position=pos)
+    assert d.action is Action.SELL and d.side is Side.NO and d.count == 10
+    assert "exit" in d.reason
+
+
+def test_exit_disabled_rides_position_when_management_off():
+    # Identical setup, but manage_positions off (the default). With no exit leg the
+    # flip is band-blocked and the loser rides to settlement — the gap the leg fixes.
+    q = MarketQuote(yes_bid=0.06, yes_ask=0.07)
+    pos = Position(side=Side.NO, count=10, avg_price=0.50)
+    d = decide(_sig(0.80, se=0.01), q, BANKROLL, RISK, position=pos)
+    assert d.action is Action.HOLD
+    assert "tradeable band" in d.reason
+
+
+def test_no_exit_when_held_side_still_plus_ev():
+    # Hold NO; the model still rates NO worth 0.80 and the book only bids 0.68 for it.
+    # Selling would dump a +EV hold (the "+EV-sale trap") — the leg must NOT fire.
+    q = MarketQuote(yes_bid=0.30, yes_ask=0.32)        # no_bid = 0.68
+    pos = Position(side=Side.NO, count=10, avg_price=0.50)
+    d = decide(_sig(0.20, se=0.01), q, BANKROLL, RISK_MANAGE, position=pos)
+    assert "exit" not in d.reason
+    assert not (d.action is Action.SELL and "exit" in d.reason)
+
+
+def test_no_exit_when_no_bid_to_sell_into():
+    # A logically-dead YES bucket (obs already past it): YES bid is 0, so there is
+    # nothing to capture — the loss is locked. The exit leg must no-op, not crash.
+    q = MarketQuote(yes_bid=0.0, yes_ask=0.02)
+    pos = Position(side=Side.YES, count=5, avg_price=0.40)
+    d = decide(_sig(0.001, se=0.001), q, BANKROLL, RISK_MANAGE, position=pos)
+    assert d.action is Action.HOLD
+    assert "exit" not in d.reason

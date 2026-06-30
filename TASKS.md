@@ -73,26 +73,27 @@ Engine arithmetic is clean (no sign/fee/idempotency bugs) — the issues are
 calibration, inputs, and proof, not the math.
 
 ## P1 — correctness & honest σ (do first)
-- [ ] **Nowcast must fold in `settlement_sigma`.** Verified gap: `weather_nowcast.py:132`
-      calls `bucket_prob_and_se` WITHOUT `settlement_sigma_f` (cf. `weather_ensemble.py:80`).
-      Roadmap #1 added the settlement-basis term to ensemble but not to the one strategy
-      carrying size → its probabilistic buckets are overconfident (Jun-29 failure mode).
-      Deterministic trades (`std_error=1e-6`) are unaffected; this is the probabilistic path.
-- [ ] **`nws_recent_temps_f` local-day filter** (already noted L54-56). Re-confirmed:
-      queries from `{date}T00:00:00+00:00` (UTC midnight = prior local evening) and appends
-      every obs with no timestamp filter. **Low live risk** (nowcast `min_hour=14` → today's
-      daytime max usually dominates), but a real latent bug and it **corrupts backtest/replay**
-      of `obs_max`. Filter obs to the target local day (station tz).
+- [~] **Nowcast `settlement_sigma` — WON'T DO (intentional, not a bug).** On reading the
+      code, `weather_ensemble.py:65-70` documents that the nowcast *deliberately* omits the
+      grid→station basis term: its obs floor is already read off the settlement station, so
+      adding `settlement_sigma_f` would be a **double penalty**. The reviewer flagged this
+      without seeing the rationale. Leaving as-is. (Open question for later: the forecast
+      *upside* above the floor is still grid-based, so a small partial-basis term might be
+      defensible — but that's a judgement call, not the naive fix.)
+- [x] **`nws_recent_temps_f` local-day filter — DONE.** `providers.py` now parses each obs
+      `timestamp`, converts to the station tz, and drops readings whose local date != target
+      (and drops timestamp-less readings). Tests in `tests/test_providers_obs_filter.py`.
+      (Low live risk given `min_hour=14`, but fixes a real latent bug + backtest/replay.)
 - [ ] **Validate IEM/station == Kalshi settlement, then flip `HEDGE_CALIBRATE_AGAINST=station`**
-      (already tracked L51-53; bump priority). Prod currently runs `truth=era5` *by design*
-      (station-truth gated until validated) — but ERA5≠settlement is the documented Jun-29
-      basis cause, so closing this is the single biggest risk reduction. Extend
-      `scripts/validate_stations.py` over the resolved-settlement set first.
-- [ ] **Move skill-gate / kill-switch evidence onto `/data`** (already tracked L48-50; bump
-      priority). Verified: guard reads `self.state` = `LIVE_DIR/hedge.db` (`runner.py:52`,
-      ephemeral), wiped every redeploy (2× in 4 min on 2026-06-30) → `skill_mult` frozen at
-      the 0.10 floor, Brier kill-switch can never reach its 20/30 samples. Safety machinery
-      + λ-ramp are effectively inert until this is durable.
+      (OPS — not in this PR). Prod runs `truth=era5` *by design* (station-truth gated until
+      validated). Closing it is the biggest risk reduction but requires running
+      `scripts/validate_stations.py` against resolved settlements, then setting a Fly secret —
+      neither doable from the code branch. Tracked for an operator.
+- [x] **Move skill-gate / kill-switch evidence onto `/data` — DONE.** `runner.py` `LIVE_DIR`
+      now honors `HEDGE_STATE_DIR`, so the decision logs (which the guard + skill gate read),
+      the `hedge.db` state, and the HALTED latch all land on the durable `/data` volume in
+      prod and survive redeploys. Verified the guard reads `LIVE_DIR.glob("decisions_*.jsonl")`
+      (not the state DB), so moving the dir is the correct fix. Local/tests unchanged.
 
 ## P2 — prove the edge before any size increase
 - [ ] **Run `score_skill_vs_market` on ≥30 settled acted-on nowcast signals**, segmented
@@ -103,17 +104,21 @@ calibration, inputs, and proof, not the math.
       set at $0 risk via `run_paper.py` rather than paying the correlated tail to gather it.
 
 ## P3 — the one defensible behavior change (low value; AFTER P1)
-- [ ] **Edge-checked exit leg** (rebuild of "let it cut losers"; the rest of the proposed
-      change is rejected below). Verified: in `decide()` the band/significance/`tau_min`/λ-floor
-      gates (`engine.py` L261-360) all return HOLD *before* `_reconcile` (L378) and evaluate the
-      opposite-side BUY (wrong leg), so non-deterministic losers can't be trimmed. Add an exit
-      check that runs **ahead of** the open pipeline, gated on `manage_positions`:
-      sells the **held** side on its own bid economics, **not** λ-scaled (full lot), bypasses
-      the open-only band+significance gates, but **keeps** `held_bid − fair_value(held) − taker_fee
-      ≥ tau_exit` (never sell a +EV hold; settlement is free). No-bid ⇒ no-op (dead buckets are
-      unrecoverable). Reuse the `manage_cooldown_cycles=2` cooldown; prefer nowcast-driven exits.
-      **Validate in paper vs hold-to-settlement (fee-net) before arming.** Also fix the misleading
-      "exits are band-exempt" comments (`engine.py:299`, `deploy/config.yaml:41`, `signal.py:44-48`).
+- [x] **Edge-checked exit leg — IMPLEMENTED (gated, off by default; needs paper validation
+      before arming).** `engine._exit_check` runs **ahead of** the open-only gates and, only
+      when the new `RiskConfig.exit_leg` flag is armed (**default off**, a dedicated switch so
+      a deploy is a no-op until validated — deploy already has `manage_positions: true`) and we
+      hold the market, sells the **held** side at its own bid when
+      `held_bid − taker_fee − fair_value ≥ tau_exit` (new `RiskConfig.tau_exit_cents`, default
+      2¢). Full-lot, not λ-scaled; no-bid ⇒ no-op. Tests in `test_decision_engine.py`
+      cover: exit fires where a flip-to-close is band-blocked, no exit on a +EV hold, no-op on
+      a dead (no-bid) bucket, and disabled when management is off.
+      **Still TODO before arming live:** validate in paper (`manage_positions` on, paper path)
+      that exit-rule P&L beats hold-to-settlement net of fees; count regretted exits / fee drag.
+      Did **not** yet rewrite the misleading "exits are band-exempt" comments (`engine.py:299`,
+      `deploy/config.yaml:41`, `signal.py:44-48`) — the new leg makes exits genuinely possible,
+      but those comments describe `_reconcile`, which is still gated; revisit when wiring the
+      paper validation.
 
 ## WONT — rejected by the review (recorded so we don't revisit)
 - **Stop-loss on win-prob/MTM threshold** — −EV "+EV-sale trap": dumping a NO the model rates
