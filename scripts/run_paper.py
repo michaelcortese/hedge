@@ -244,9 +244,42 @@ def cmd_score(days: int, prod: bool = False) -> None:
     print(board.to_string(index=False))
 
 
+def cmd_skill(days: int, prod: bool = False) -> None:
+    """Score model-vs-market skill (Brier) by strategy and hour — the #3 go/no-go view.
+
+    The live skill gate ramps λ on exactly this signal (model Brier beating the market
+    mid). This is its offline counterpart: prove the nowcast beats the mid in the
+    afternoon window BEFORE arming real size.
+    """
+    paths = sorted(paper.PAPER_DIR.glob("signals_*.jsonl"))[-days:]
+    if not paths:
+        sys.exit("no logged signals yet — run `snapshot`/`loop` first.")
+    rows = paper.load_rows(paths)
+    client = _client(prod)
+    outcomes: dict[str, bool] = {}
+    for ticker in rows["ticker"].unique():
+        try:
+            m = client.get_market(ticker).get("market", {})
+        except Exception:  # noqa: BLE001
+            continue
+        result = str(m.get("result", "")).lower()
+        if result in ("yes", "no"):
+            outcomes[ticker] = result == "yes"
+
+    overall = paper.score_skill_vs_market(rows, outcomes, by_hour=False)
+    if overall.empty:
+        print(f"{len(rows)} signals logged; {len(outcomes)} settled. "
+              "No scored signals yet — wait for more settlements.")
+        return
+    print("SKILL vs MARKET MID — overall (skill>0 => model beats the market):")
+    print(overall.to_string(index=False))
+    print("\nby strategy × UTC hour (confirm the nowcast edge concentrates afternoon):")
+    print(paper.score_skill_vs_market(rows, outcomes, by_hour=True).to_string(index=False))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["snapshot", "loop", "score", "edge"])
+    ap.add_argument("mode", choices=["snapshot", "loop", "score", "edge", "skill"])
     ap.add_argument("--prod", action="store_true",
                     help="read live PROD market data (keyless, read-only, never places orders)")
     ap.add_argument("--days", type=int, default=14, help="score: how many recent log days to include")
@@ -261,6 +294,8 @@ def main() -> None:
         cmd_snapshot(args.prod)
     elif args.mode == "edge":
         cmd_edge(args.prod)
+    elif args.mode == "skill":
+        cmd_skill(args.days, args.prod)
     elif args.mode == "loop":
         if args.interval <= 0:
             sys.exit("--interval must be > 0")
