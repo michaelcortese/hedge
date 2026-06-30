@@ -1,0 +1,34 @@
+# Speech / word-mention corpus — API keys + per-provider settings.
+#
+# Copy this to ONE of (first found wins):
+#   * $HEDGE_SPEECH_CONFIG  (any path)
+#   * secrets/speech_apis.yaml   (the secrets/ dir is gitignored — preferred)
+#   * config.speech.yaml         (repo root — keep it OUT of git yourself)
+#
+# Any api_key may also be supplied via env var, which OVERRIDES the file:
+#   HEDGE_SPEECH_<PROVIDER>_KEY   e.g. HEDGE_SPEECH_FACTBASE_KEY=...
+#
+# Enable rules: keyed providers turn on automatically once api_key is set
+# (unless enabled: false). Keyless providers (gdelt) must be opted in explicitly.
+
+providers:
+  # Roll Call / Factbase — best source for politician speech base rates (Trump
+  # etc.). Endpoint + auth depend on your access tier; set base_url in code.
+  factbase:
+    api_key: ""          # <- your Factbase/Roll Call key
+    # enabled: true      # auto-on when api_key is set
+
+  # congress.gov — Congressional Record floor remarks (members of Congress).
+  # Free key: https://api.congress.gov/sign-up/
+  congress_gov:
+    api_key: ""
+
+  # newsapi.org — news-mention PROXY (not transcripts). Weak, secondary signal.
+  # Key: https://newsapi.org/
+  newsapi:
+    api_key: ""
+    enabled: false       # off by default; it's a noisy proxy
+
+  # GDELT DOC API — keyless news-mention proxy. Opt in explicitly; keep low-weight.
+  gdelt:
+    enabled: false
