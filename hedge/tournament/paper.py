@@ -208,3 +208,35 @@ def score(rows: pd.DataFrame, outcomes: dict[str, bool],
         total_pnl=("pnl_per_contract", "sum"),
         kelly_bankroll_growth=("kelly_pnl", "sum"),
     ).reset_index().sort_values("pnl_per_contract", ascending=False)
+
+
+def score_skill_vs_market(rows: pd.DataFrame, outcomes: dict[str, bool],
+                          *, by_hour: bool = True) -> pd.DataFrame:
+    """Does each strategy's probability beat the MARKET MID out-of-sample? (#3 step 5).
+
+    The profitability question on ~efficient weather books isn't "is the model
+    calibrated" but "does it beat the price". For every logged signal on a settled
+    market, compare the Brier of the model's P(YES) to the Brier of the market mid
+    ((yes_bid+yes_ask)/2); ``skill = brier_market - brier_model`` (>0 => the model
+    beats the market). Grouped by strategy and, when ``by_hour``, the UTC hour of the
+    snapshot — so you can confirm the nowcast's edge concentrates in the afternoon
+    window before arming live size. (Hour is UTC; the cities span ET/CT.)
+    """
+    sub = rows[rows["ticker"].isin(outcomes)].copy()
+    if sub.empty:
+        return pd.DataFrame()
+    sub["outcome"] = sub["ticker"].map(lambda t: 1.0 if outcomes[t] else 0.0)
+    sub["mid"] = (sub["yes_bid"] + sub["yes_ask"]) / 2.0
+    sub["brier_model"] = (sub["prob"] - sub["outcome"]) ** 2
+    sub["brier_market"] = (sub["mid"] - sub["outcome"]) ** 2
+    keys = ["strategy"]
+    if by_hour:
+        sub["utc_hour"] = sub["ts"].str.slice(11, 13).astype(int)
+        keys.append("utc_hour")
+    g = sub.groupby(keys).agg(
+        n=("outcome", "size"),
+        brier_model=("brier_model", "mean"),
+        brier_market=("brier_market", "mean"),
+    ).reset_index()
+    g["skill"] = g["brier_market"] - g["brier_model"]
+    return g.sort_values(keys)

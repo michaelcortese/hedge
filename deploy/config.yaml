@@ -41,6 +41,15 @@ risk:
                             # Price band keeps opens out of the tails.
   manage_cooldown_cycles: 2 # don't re-act on a managed ticker for 2 cycles (anti-churn)
 
+# Per-strategy Kelly-λ multiplier (#3 "concentrate on the one real edge"). Morning
+# forecast bets have no durable edge vs an efficient mid pulling the same free feeds —
+# run them at ~0 size (paper/log only) and put size on the intraday obs-lag nowcast.
+# Missing strategy => 1.0. Composes with the guard skill multiplier below.
+strategy_lambda:
+  weather_ensemble: 0.0     # all-day forecast workhorse — no edge vs mid, log only
+  weather_blend: 0.0        # ensemble-then-nowcast; the nowcast carries size directly
+  weather_nowcast: 1.0      # the intraday obs-lag edge — the only one that carries size
+
 guard:
   enabled: true
   min_samples: 20
@@ -49,3 +58,13 @@ guard:
   tolerance: 0.05
   window_days: 14
   flatten_on_trip: false
+  # Market-relative skill gate (#3 step 4): scale λ by demonstrated OOS skill vs the
+  # MARKET MID, not just calibration. Until the acted-on probabilities beat the mid's
+  # Brier over skill_min_samples settled trades, size stays at skill_floor (a small
+  # bootstrap so the high-confidence deterministic trades still place and accrue the
+  # settled samples that let it ramp); it scales to full λ at skill_full_at of skill.
+  # Prove the edge offline first: scripts/run_paper.py skill.
+  skill_gate: true
+  skill_min_samples: 30
+  skill_full_at: 0.02
+  skill_floor: 0.10

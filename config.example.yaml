@@ -34,6 +34,17 @@ risk:
   max_price: 0.90          # rich-side mirror of min_price
   max_order_dollars: 25.0  # HARD absolute ceiling on $-at-risk per order (early-live
                            # backstop; null = fractions only). Raise as P&L is proven.
+  event_cap_frac: 0.06     # max bankroll fraction at risk across ALL buckets of one
+                           # city-day (they are correlated; caps the cluster)
+  participation_frac: 0.25 # take at most this fraction of resting depth per order (book)
+
+# Per-strategy Kelly-λ multiplier (#3). Run the no-edge morning forecast strategies at
+# ~0 size (paper/log only) and put size on the intraday obs-lag nowcast. Omit a strategy
+# (or the whole section) to leave it at full λ. Composes with the guard skill gate.
+strategy_lambda:
+  weather_ensemble: 0.0
+  weather_blend: 0.0
+  weather_nowcast: 1.0
 
 # Model-failure kill-switch: halt trading if realized calibration (Brier score of
 # acted-on probabilities vs settled outcomes) drifts badly. Tripping is a latch —
@@ -51,3 +62,12 @@ guard:
   tolerance: 0.05          # allowed drift above baseline_brier (threshold = sum)
   window_days: 14          # how far back to read settled decisions
   flatten_on_trip: false   # also sell out of open positions when tripped
+  # Market-relative skill gate (#3 step 4): scale λ by demonstrated OOS skill vs the
+  # MARKET MID (does the model beat the price, not just calibration?). OFF by default;
+  # when on, size stays at skill_floor until acted-on probs beat the mid's Brier over
+  # skill_min_samples settled trades, ramping to full λ at skill_full_at of skill.
+  # Prove it offline first: scripts/run_paper.py skill.
+  skill_gate: false
+  skill_min_samples: 30
+  skill_full_at: 0.02      # Brier-skill margin (market - model) for full size
+  skill_floor: 0.10        # λ multiplier before skill is proven (small bootstrap)

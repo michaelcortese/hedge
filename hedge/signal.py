@@ -36,6 +36,16 @@ class Signal:
         meta:     Free-form dict for anything you want to log alongside the
                   signal (intermediate values, scenario breakdowns, etc.). Never
                   read by the decision engine.
+        deterministic: The outcome is LOGICALLY settled, not a probabilistic
+                  estimate — e.g. the observed max-so-far already exceeds a
+                  bucket's upper bound, so YES is impossible (``prob≈0``), or an
+                  "X or above" threshold is already met (``prob≈1``). The decision
+                  engine may bypass the tradeable-price *band* for such a signal
+                  (a near-certain NO sits in the rich tail the band normally
+                  blocks), while ALL other guards — significance, fees, depth,
+                  participation, per-event/portfolio caps, station validation —
+                  still apply. Only set this when the outcome is genuinely
+                  determined by observation, never for a merely-confident estimate.
     """
 
     ticker: str
@@ -44,6 +54,7 @@ class Signal:
     std_error: float | None = None
     strategy: str = "unknown"
     meta: dict[str, Any] = field(default_factory=dict)
+    deterministic: bool = False
 
     def __post_init__(self) -> None:
         if not (0.0 < self.prob < 1.0):

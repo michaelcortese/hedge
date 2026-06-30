@@ -1,7 +1,9 @@
 # hedge — strategy roadmap
 
-Tracking the weather-strategy improvement plan from the 6-lens tournament. #1 and #2
-are implemented on branch `weather-honest-sigma-and-sizing`; #3 is next.
+Tracking the weather-strategy improvement plan from the 6-lens tournament. #1, #2, and
+#3 are implemented and merged/open. Remaining work is the follow-ups below — the next
+step is **proving the nowcast edge in paper** (`run_paper.py skill`) before trusting the
+skill-gate ramp on real money.
 
 ## ✅ #1 — Honest σ tied to the settlement instrument (done)
 Calibrate against the IEM ASOS station daily-max (the value Kalshi settles on), not
@@ -20,30 +22,27 @@ per-event (city-day) concentration cap and an order-book participation cap.
   `RiskConfig.event_cap_frac/participation_frac`, `decide(event_at_risk=…)`,
   runner fetches the book per market and tracks per-event at-risk.
 
-## ⛳ #3 — Concentrate on the one real edge (NEXT)
+## ✅ #3 — Concentrate on the one real edge (done)
 Run morning forecast bets at ~zero size; put size on the intraday obs-lag and the
-deterministic "impossible-bucket" NO trade; gate live λ on demonstrated out-of-sample
-skill vs the **market mid** (not just vs climatology). Combines tournament ideas
-31 + 32 + 36. **Do not size anything that hasn't beaten the market-mid Brier OOS.**
+deterministic "impossible-bucket" NO trade; gate live λ on demonstrated OOS skill vs
+the **market mid**. **Do not size anything that hasn't beaten the market-mid Brier OOS.**
+- **Per-strategy λ:** `strategy_lambda` config → runner scales λ per strategy
+  (`weather_ensemble`/`weather_blend` = 0, `weather_nowcast` = 1); `decide` reports a
+  "zero target size" hold.
+- **Afternoon window:** `WeatherNowcastStrategy.min_hour` 12 → **14**; abstains before it.
+- **Deterministic impossible/certain bucket:** `Signal.deterministic`; the nowcast emits
+  it when the NWS-rounded observed max already settles a bucket (validated stations only);
+  `decide` bypasses the price band for it but keeps every other guard.
+- **Skill-vs-market gate:** `guard.market_skill` + `GuardConfig.skill_gate/skill_min_samples/
+  skill_full_at/skill_floor`; runner records the market mid per decision and ramps λ as
+  acted-on probs beat the mid's Brier OOS (the absolute/baseline latch stays the backstop).
+- **Prove it first:** `scripts/run_paper.py skill` → Brier-by-hour vs market mid.
+- deploy: `strategy_lambda` set; `skill_gate: true` with a 0.10 bootstrap floor.
 
-Plan:
-1. **Per-strategy λ.** Let `deploy/config.yaml` set lambda per strategy so
-   `weather_ensemble`/`weather_blend` run at ~0 size (paper/log only) and
-   `weather_nowcast` carries size. Plumb a per-strategy multiplier through
-   `_default_strategies`/`_best_decision` (the runner already picks best-edge per market).
-2. **Tighten the nowcast window.** Raise `WeatherNowcastStrategy.min_hour` toward ~15
-   local; return `None` before it so morning cycles abstain.
-3. **Deterministic impossible-bucket NO.** In `weather_nowcast.evaluate`, when the
-   fresh observed max already exceeds a bucket's upper bound, emit `Signal(prob≈ε,
-   meta={'deterministic': True})`; add a `decide` branch that bypasses the
-   `[min_price, max_price]` band for deterministic signals but keeps the depth /
-   participation / event caps and requires a fresh obs + validated station.
-4. **Skill-vs-market gate.** Extend `guard.py` to score acted-on probabilities' Brier
-   against the **market mid** on settled trades (state.py has decisions/fills/outcomes);
-   ramp `lambda_kelly` up only as positive market-relative skill accrues, down as it
-   decays. Keep the existing absolute/baseline-Brier latch as the hard backstop.
-5. **Prove it first.** `scripts/run_paper.py loop` → score Brier-by-hour; confirm the
-   nowcast beats the market mid in the 15:00+ window before arming real size.
+**Operating note:** the skill gate is bootstrapped via the high-confidence deterministic
+trades (they place ≥1 contract even at the floor and accrue settled samples). Confirm
+the nowcast beats the mid in paper (`run_paper.py skill`) before raising `skill_floor`
+or trusting the ramp on real money.
 
 ## Follow-ups surfaced while doing #1/#2
 - **DB durability:** the live `hedge.db` writes to `/app/data/runs/live/` (ephemeral

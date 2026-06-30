@@ -297,7 +297,11 @@ def decide(
     # we'd buy are long-shot tail bets — worst-calibrated, fee-heavy, and with no
     # bid to exit into (they can only ride to 0). The rich side mirrors this. Gates
     # opens only; _reconcile may still trim/close an existing holding below the band.
-    if not (cfg.min_price <= exec_price <= cfg.max_price):
+    #
+    # EXCEPTION: a DETERMINISTIC signal (the observed max already settled the bucket)
+    # is exempt — its "tail" price is near-certain, not a long-shot, and settlement is
+    # free so there's no exit-liquidity problem. Every other guard still applies.
+    if not signal.deterministic and not (cfg.min_price <= exec_price <= cfg.max_price):
         return _hold(
             ticker,
             f"exec price {exec_price:.2f} outside tradeable band "
@@ -329,8 +333,12 @@ def decide(
     abs_cap = cfg.max_order_dollars if cfg.max_order_dollars is not None else math.inf
     capital = min(target_capital, market_capital, portfolio_room, event_room, abs_cap)
     if capital <= 0:
-        reason = ("event cap leaves no room" if event_room <= portfolio_room
-                  else "portfolio cap leaves no room")
+        if target_capital <= 0:                       # λ→0 (e.g. paper/log-only strategy)
+            reason = "zero target size (lambda or edge ~0)"
+        elif event_room <= portfolio_room and event_room <= market_capital:
+            reason = "event cap leaves no room"
+        else:
+            reason = "portfolio cap leaves no room"
         return _hold(ticker, reason, edge=cons_edge, **base)
 
     count = int(math.floor(capital / exec_price))

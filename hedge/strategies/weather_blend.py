@@ -35,7 +35,7 @@ class WeatherBlendStrategy(Strategy):
         n_draws: int = 20_000,
         as_of: date | None = None,
         now: datetime | None = None,
-        min_hour: int = 12,
+        min_hour: int = 14,
     ):
         source = source or LiveForecastSource()
         calibration = calibration or CalibrationTable()
@@ -54,6 +54,7 @@ class WeatherBlendStrategy(Strategy):
                 ticker=sig.ticker, prob=sig.prob, n_draws=sig.n_draws,
                 std_error=sig.std_error, strategy=self.name,
                 meta={**sig.meta, "via": "nowcast"},
+                deterministic=sig.deterministic,
             )
         sig = self.ensemble.evaluate(market)
         if sig is not None:

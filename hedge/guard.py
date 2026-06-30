@@ -39,6 +39,18 @@ class GuardConfig:
     window_days: int = 14            # how far back to read settled decisions
     flatten_on_trip: bool = False    # also sell out of open positions when tripped
 
+    # --- market-relative skill gate (separate from the Brier kill-switch) ----------
+    # The kill-switch above asks "is the model badly miscalibrated?". This gate asks
+    # the sharper question the tournament demanded: "does the model actually beat the
+    # MARKET MID out-of-sample?" — because on ~efficient weather books a well-calibrated
+    # model that merely matches the mid earns nothing after fees. When enabled it scales
+    # lambda_kelly by demonstrated skill: ~0 until the acted-on probabilities beat the
+    # market-mid Brier over enough settled trades, ramping to full as the edge proves out.
+    skill_gate: bool = False         # OFF by default (library default unchanged)
+    skill_min_samples: int = 30      # settled acted-on trades before size can rise off the floor
+    skill_full_at: float = 0.02      # Brier-skill margin (market - model) for FULL size
+    skill_floor: float = 0.0         # lambda multiplier before skill is proven (0 = no size)
+
     @property
     def threshold(self) -> float:
         """The Brier value above which we trip."""
@@ -68,6 +80,43 @@ def brier_score(samples: list[tuple[float, bool]]) -> float | None:
     if not samples:
         return None
     return sum((p - (1.0 if y else 0.0)) ** 2 for p, y in samples) / len(samples)
+
+
+@dataclass(frozen=True)
+class SkillStatus:
+    """Out-of-sample skill of acted-on probabilities vs the market mid."""
+
+    n: int
+    brier_model: float | None        # Brier of the model's acted-on P(YES)
+    brier_market: float | None       # Brier of the market mid at decision time
+    skill: float | None              # brier_market - brier_model (>0 => beats market)
+    multiplier: float                # lambda_kelly scale in [skill_floor, 1]
+
+
+def market_skill(samples: list[tuple[float, float, bool]],
+                 cfg: GuardConfig) -> SkillStatus:
+    """Score model-vs-market skill and derive a lambda multiplier.
+
+    ``samples`` is ``(model_prob, market_mid, outcome_yes)`` per settled acted-on
+    trade. Skill is the market's Brier minus the model's Brier: positive means the
+    model's probabilities beat the market mid out-of-sample. The multiplier ramps the
+    Kelly fraction from ``skill_floor`` (until ``skill_min_samples`` settle, or while
+    skill is non-positive) linearly up to 1.0 at ``skill_full_at`` of Brier skill.
+    Pure and side-effect-free. With the gate disabled the multiplier is always 1.0.
+    """
+    n = len(samples)
+    if not cfg.skill_gate:
+        return SkillStatus(n, None, None, None, 1.0)
+    if n < cfg.skill_min_samples:
+        return SkillStatus(n, None, None, None, cfg.skill_floor)
+    bm = brier_score([(p, y) for p, _mid, y in samples])
+    bk = brier_score([(mid, y) for _p, mid, y in samples])
+    assert bm is not None and bk is not None
+    skill = bk - bm
+    span = cfg.skill_full_at if cfg.skill_full_at > 0 else 1e-9
+    ramp = max(0.0, min(1.0, skill / span))
+    mult = max(cfg.skill_floor, ramp)
+    return SkillStatus(n, bm, bk, skill, mult)
 
 
 def assess(samples: list[tuple[float, bool]], cfg: GuardConfig) -> GuardStatus:

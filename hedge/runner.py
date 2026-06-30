@@ -27,7 +27,7 @@ import os
 import signal as _signal
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -37,7 +37,7 @@ from hedge.config import build_client
 from hedge.decision import Action, Decision, MarketQuote, Position, RiskConfig, Side, decide
 from hedge.execution import Executor, OrderTicket
 from hedge.execution.executor import parse_order
-from hedge.guard import GuardConfig, GuardStatus, assess
+from hedge.guard import GuardConfig, GuardStatus, assess, market_skill
 from hedge.state import State
 from hedge.strategies.base import MarketView, Strategy
 from hedge.strategies.weather_blend import WeatherBlendStrategy
@@ -106,6 +106,7 @@ class Runner:
     def __init__(self, client, strategies, executor: Executor, cfg: RiskConfig,
                  *, bankroll_override: float | None = None,
                  guard_cfg: GuardConfig | None = None,
+                 strategy_lambda: dict[str, float] | None = None,
                  state: State | None = None):
         self.client = client
         self.strategies = strategies
@@ -113,6 +114,11 @@ class Runner:
         self.cfg = cfg
         self.bankroll_override = bankroll_override
         self.guard_cfg = guard_cfg or GuardConfig()
+        # Per-strategy Kelly-λ multiplier (#3): run the no-edge morning forecast
+        # strategies at ~0 size (paper/log only) and put size on the intraday nowcast.
+        # Missing strategy -> 1.0 (full base λ). Composes with the skill multiplier.
+        self.strategy_lambda = strategy_lambda or {}
+        self._skill_mult = 1.0   # refreshed each cycle when the skill gate is enabled
         # Durable state lives next to the decision logs (the Fly volume in prod).
         self.state = state if state is not None else State(LIVE_DIR / "hedge.db")
 
@@ -312,6 +318,34 @@ class Runner:
             samples.append((float(r["prob"]), outcomes[t]))
         return assess(samples, self.guard_cfg)
 
+    def evaluate_skill_multiplier(self) -> float:
+        """λ multiplier in [skill_floor, 1] from OOS skill vs the market mid (#3).
+
+        Scores acted-on opening probabilities against the market mid recorded at
+        decision time, on markets that have since settled, and ramps size up only as
+        the model demonstrably beats the mid. 1.0 (no effect) when the gate is off.
+        Demo/dry-run BUY decisions are logged and scored too, so the gate can be proven
+        before real size is armed. Best-effort: any hiccup yields the conservative floor.
+        """
+        if not self.guard_cfg.skill_gate:
+            return 1.0
+        try:
+            rows = self._recent_decision_rows()
+            outcomes = self._settlement_outcomes({r["ticker"] for r in rows})
+            seen: set[str] = set()
+            samples: list[tuple[float, float, bool]] = []
+            for r in rows:
+                t = r["ticker"]
+                mid = (r.get("meta") or {}).get("mid")
+                if t in seen or t not in outcomes or mid is None:
+                    continue
+                seen.add(t)
+                samples.append((float(r["prob"]), float(mid), outcomes[t]))
+            return market_skill(samples, self.guard_cfg).multiplier
+        except Exception as e:  # noqa: BLE001 — gate must never crash a cycle
+            print(f"[runner] skill gate failed ({e}); using floor", flush=True)
+            return self.guard_cfg.skill_floor
+
     def _flatten(self) -> list[OrderTicket]:
         """Sell out of every open position (cross to the bid). Used on a trip."""
         tickets: list[OrderTicket] = []
@@ -370,6 +404,10 @@ class Runner:
             if status.tripped:
                 self._trip(status)
                 return []
+
+        # Market-relative skill gate (#3): scale λ by demonstrated OOS skill vs the
+        # market mid. 1.0 when the gate is disabled; ~0 until the edge is proven.
+        self._skill_mult = self.evaluate_skill_multiplier()
 
         bankroll = self.bankroll()
         positions = self.positions()
@@ -452,6 +490,9 @@ class Runner:
                 reserved = decision.count * decision.price
                 portfolio_at_risk += reserved
                 event_at_risk[ekey] = event_at_risk.get(ekey, 0.0) + reserved
+            # Stamp the market mid at decision time so the skill gate can later score
+            # the acted-on probability against what the market thought (#3, step 4).
+            decision.meta["mid"] = round(quote.mid, 4)
             ticket = self.executor.place(
                 decision, idem_key=self._idem_key(decision),
             )
@@ -692,6 +733,7 @@ class Runner:
             "realized_today": round(self.state.realized_today(), 2),
             "halted": halted,
             "halt_reason": reason or None,
+            "skill_mult": round(self._skill_mult, 3),
         }
         try:
             base = Path(os.environ.get("HEDGE_STATE_DIR", str(LIVE_DIR)))
@@ -729,7 +771,11 @@ class Runner:
                 continue
             if sig is None:
                 continue
-            d = decide(sig, quote, bankroll, self.cfg,
+            # Effective λ for THIS strategy: base × per-strategy multiplier × skill gate.
+            scale = self.strategy_lambda.get(sig.strategy, 1.0) * self._skill_mult
+            scfg = (self.cfg if scale == 1.0
+                    else replace(self.cfg, lambda_kelly=self.cfg.lambda_kelly * scale))
+            d = decide(sig, quote, bankroll, scfg,
                        position=position, portfolio_at_risk=portfolio_at_risk,
                        event_at_risk=event_at_risk)
             d.meta["strategy"] = sig.strategy
@@ -926,8 +972,11 @@ def main(argv: list[str] | None = None) -> None:
     if args.no_guard:
         guard_cfg = GuardConfig(enabled=False)
     executor = Executor(client, env=env, dry_run=not args.live, allow_prod=args.allow_prod)
+    strategy_lambda = {str(k): float(v)
+                       for k, v in _section_from_config("strategy_lambda").items()}
     runner = Runner(client, _default_strategies(), executor, _risk_from_config(),
-                    bankroll_override=args.bankroll, guard_cfg=guard_cfg)
+                    bankroll_override=args.bankroll, guard_cfg=guard_cfg,
+                    strategy_lambda=strategy_lambda)
 
     if args.reset_guard:
         cleared = runner.reset_guard()
