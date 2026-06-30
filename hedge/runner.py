@@ -44,8 +44,9 @@ from hedge.strategies.base import MarketView, Strategy
 from hedge.strategies.weather_blend import WeatherBlendStrategy
 from hedge.strategies.weather_ensemble import WeatherEnsembleStrategy
 from hedge.strategies.weather_nowcast import WeatherNowcastStrategy
+from hedge.weather import providers
 from hedge.weather.calibration import CalibrationTable
-from hedge.weather.markets import discover_temp_markets
+from hedge.weather.markets import discover_temp_markets, parse_temp_market
 from hedge.weather.sources import LiveForecastSource
 from hedge.weather.stations import STATIONS, station_for_ticker
 
@@ -109,7 +110,10 @@ class Runner:
                  guard_cfg: GuardConfig | None = None,
                  strategy_lambda: dict[str, float] | None = None,
                  state: State | None = None,
-                 eventlog: EventLog | None = None):
+                 eventlog: EventLog | None = None,
+                 datalog: EventLog | None = None,
+                 capture_market_data: bool = True,
+                 marketdata_retention_days: int = 30):
         self.client = client
         self.strategies = strategies
         self.executor = executor
@@ -130,6 +134,17 @@ class Runner:
         # on the durable volume in prod and tracks a monkeypatched LIVE_DIR in tests.
         self.eventlog = eventlog if eventlog is not None else EventLog(
             Path(os.environ.get("HEDGE_STATE_DIR", str(LIVE_DIR))) / "events")
+        # Market + weather research dataset — the PRIMARY content of the durable log:
+        # every cycle we record the raw GET /markets payload + order book per market and
+        # the raw Open-Meteo/NWS weather payloads per station, so the inputs the model
+        # saw can be replayed/backtested. Kept in a SEPARATE stream (``marketdata/``,
+        # prefix ``data``) from the trade audit trail so it can be retention-capped
+        # (it's the bulk) without ever pruning the trade history. Best-effort.
+        self.capture_market_data = capture_market_data
+        self.marketdata_retention_days = marketdata_retention_days
+        self.datalog = datalog if datalog is not None else EventLog(
+            Path(os.environ.get("HEDGE_STATE_DIR", str(LIVE_DIR))) / "marketdata",
+            prefix="data")
 
     # ----- state from Kalshi -------------------------------------------------
     def bankroll(self) -> float:
@@ -213,6 +228,65 @@ class Runner:
     def _mark_manage(self, ticker: str) -> None:
         """Stamp the current cycle as the last time we managed ``ticker``."""
         self.state.set_meta(f"mgmt_cycle:{ticker}", str(getattr(self, "_cycle_seq", 0)))
+
+    # ----- market + weather research dataset (the durable data log) ----------
+    def _capture_market_data(self, views: list[MarketView]) -> None:
+        """Append the raw market + weather inputs this cycle to the data log.
+
+        One ``market`` event per market (the full ``GET /markets`` payload + the order
+        book) and one ``weather`` event per unique station-day (the raw Open-Meteo and
+        NWS payloads the model saw, plus the derived per-model highs / obs-max). The
+        weather fetches reuse this cycle's provider cache, so they add no API calls. The
+        whole thing is best-effort — a capture failure must never disturb trading — and
+        applies the retention cap at the end so the bulky raw data can't fill the volume.
+        """
+        if not self.capture_market_data:
+            return
+        seq = getattr(self, "_cycle_seq", None)
+        try:
+            for v in views:
+                self.datalog.emit("market", {
+                    "ticker": v.ticker,
+                    "raw": v.raw,
+                    "orderbook": v.orderbook or None,
+                    "yes_bid": v.yes_bid,
+                    "yes_ask": v.yes_ask,
+                    "mid": v.mid,
+                }, seq=seq)
+            seen: set[tuple[str, str]] = set()
+            for v in views:
+                tm = parse_temp_market(v.raw)
+                if tm is None:
+                    continue
+                key = (tm.series, tm.local_date.isoformat())
+                if key in seen:
+                    continue
+                seen.add(key)
+                self._emit_weather(tm, seq)
+            self.datalog.prune(self.marketdata_retention_days)
+        except Exception as e:  # noqa: BLE001 — capture must never crash a cycle
+            print(f"[runner] market-data capture failed ({type(e).__name__}: {e})", flush=True)
+
+    def _emit_weather(self, tm, seq) -> None:
+        """Emit one ``weather`` event for a station-day: raw payloads + derived values."""
+        st, d = tm.station, tm.local_date
+        try:
+            recs = providers.open_meteo_forecast(st, d)
+            highs = [r.daily_high_f for r in recs if r.daily_high_f is not None]
+            temps = providers.nws_recent_temps_f(st, d)
+            self.datalog.emit("weather", {
+                "series": st.series,
+                "city": st.city,
+                "station": st.nws_station,
+                "local_date": d.isoformat(),
+                "point_highs": highs,
+                "obs_max": max(temps) if temps else None,
+                "raw_open_meteo": providers.open_meteo_forecast_raw(st, d),
+                "raw_nws_forecast": providers.nws_forecast_raw(st, d),
+                "raw_nws_obs": providers.nws_observations_raw(st, d),
+            }, seq=seq)
+        except Exception as e:  # noqa: BLE001 — one station's weather miss isn't fatal
+            print(f"[runner] weather capture failed for {st.series} ({e})", flush=True)
 
     def market_views(self) -> list[MarketView]:
         views: list[MarketView] = []
@@ -433,6 +507,8 @@ class Runner:
         if self.cfg.manage_positions:
             covered = {v.ticker for v in views}
             views += self._held_ticker_views(positions, covered)
+        # Capture the raw market + weather inputs this cycle (the research dataset).
+        self._capture_market_data(views)
         self._heartbeat(bankroll, positions)
 
         # Capital already at risk in open positions seeds the portfolio cap, and —
@@ -1043,9 +1119,12 @@ def main(argv: list[str] | None = None) -> None:
     executor = Executor(client, env=env, dry_run=not args.live, allow_prod=args.allow_prod)
     strategy_lambda = {str(k): float(v)
                        for k, v in _section_from_config("strategy_lambda").items()}
+    md = _section_from_config("marketdata")
     runner = Runner(client, _default_strategies(), executor, _risk_from_config(),
                     bankroll_override=args.bankroll, guard_cfg=guard_cfg,
-                    strategy_lambda=strategy_lambda)
+                    strategy_lambda=strategy_lambda,
+                    capture_market_data=bool(md.get("enabled", True)),
+                    marketdata_retention_days=int(md.get("retention_days", 30)))
 
     if args.reset_guard:
         cleared = runner.reset_guard()

@@ -69,6 +69,15 @@ guard:
   skill_full_at: 0.02
   skill_floor: 0.10
 
+# Market + weather research dataset (the durable data log). Each cycle records the raw
+# GET /markets payload + order book per market and the raw Open-Meteo/NWS payloads per
+# station to $HEDGE_STATE_DIR/marketdata/data_YYYY-MM-DD.jsonl (the /data volume) — the
+# inputs the model saw, for replay/backtest. Separate stream from the trade audit log,
+# retention-capped because it is the bulk. Inspect: python -m hedge.eventlog data count.
+marketdata:
+  enabled: true
+  retention_days: 30        # keep this many days of raw market/weather files; older pruned
+
 # Alerts are delivered via the HEDGE_ALERT_URL Fly secret (env).
 # This section is mostly for local docs / reference. Multi-channel scaffold
 # supported (comma in HEDGE_ALERT_URL or alerts.channels list).

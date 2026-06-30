@@ -240,3 +240,61 @@ def nws_recent_temps_f(
             continue
         temps.append(c * 9 / 5 + 32)  # API returns Celsius
     return temps
+
+
+# --------------------------------------------------------------------------- #
+# Raw-response accessors — capture the exact API payloads the model saw.        #
+#                                                                               #
+# These return the unparsed JSON the parsing functions above reduce, reusing    #
+# the SAME cache keys/params so a call within the same cycle is a cache hit (no  #
+# extra API request). The runner's market+weather data log emits these verbatim #
+# so the research dataset is a byte-faithful record that can replay the model.  #
+# --------------------------------------------------------------------------- #
+def open_meteo_forecast_raw(
+    station: Station, target_date: date, models: list[str] | None = None,
+    *, ttl: float | None = _LIVE_TTL,
+) -> dict | None:
+    """Raw Open-Meteo multi-model forecast JSON (daily high + hourly per model)."""
+    models = models or DEFAULT_MODELS
+    params = {
+        "latitude": station.lat,
+        "longitude": station.lon,
+        "timezone": station.tz,
+        "temperature_unit": "fahrenheit",
+        "daily": "temperature_2m_max",
+        "hourly": "temperature_2m",
+        "models": ",".join(models),
+        "start_date": target_date.isoformat(),
+        "end_date": target_date.isoformat(),
+    }
+    key = f"openmeteo:{station.series}:{target_date}:{','.join(models)}"
+    return _get_json(OPEN_METEO_URL, params, key, ttl)
+
+
+def nws_forecast_raw(
+    station: Station, target_date: date, *, ttl: float | None = _LIVE_TTL,
+) -> dict | None:
+    """Raw NWS gridpoint forecast JSON (the 12-hour ``periods`` ``nws_forecast`` reads)."""
+    pkey = f"nws-points:{station.lat},{station.lon}"
+    points = _get_json(
+        f"https://api.weather.gov/points/{station.lat},{station.lon}",
+        None, pkey, ttl=None,
+    )
+    if not points:
+        return None
+    forecast_url = points.get("properties", {}).get("forecast")
+    if not forecast_url:
+        return None
+    fkey = f"nws-forecast:{station.series}:{target_date}"
+    return _get_json(forecast_url, None, fkey, ttl)
+
+
+def nws_observations_raw(
+    station: Station, target_date: date, *, ttl: float | None = 600.0,
+) -> dict | None:
+    """Raw NWS observations feature collection (the obs ``nws_recent_temps_f`` reduces)."""
+    key = f"nws-obs:{station.nws_station}:{target_date}"
+    return _get_json(
+        f"https://api.weather.gov/stations/{station.nws_station}/observations",
+        {"start": f"{target_date.isoformat()}T00:00:00+00:00"}, key, ttl,
+    )
