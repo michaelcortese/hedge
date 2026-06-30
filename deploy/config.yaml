@@ -19,6 +19,14 @@ risk:
   tau_min_cents: 2
   market_cap_frac: 0.03
   portfolio_cap: 0.30
+  event_cap_frac: 0.06      # cap total risk across all buckets of one city-day. They
+                            # are correlated (one synoptic draw) — a biased center misses
+                            # them together, the 2026-06-29 failure mode. Caps the cluster.
+  participation_frac: 0.25  # take at most 25% of the size resting at our price per order,
+                            # so a large Kelly target is shrunk, not walked through the book.
+  # NB: structural settlement-basis uncertainty is applied in °F inside the predictive
+  # distribution (calibration.settlement_sigma + bucket_prob_and_se), NOT here —
+  # RiskConfig.sigma_model is in PROBABILITY units and is left at its 0.0 default.
   rebalance_band: 0.25
   min_price: 0.10           # don't open below 10c: tail bets, no exit liquidity
   max_price: 0.90           # rich-side mirror

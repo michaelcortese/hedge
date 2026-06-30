@@ -73,6 +73,7 @@ def build_distribution(
     floor_high: float | None = None,
     bias: float = 0.0,
     mean_dispersion: float | None = None,
+    settlement_sigma_f: float = 0.0,
 ) -> HighTempDistribution:
     """Build a predictive distribution of the rounded daily high.
 
@@ -95,6 +96,11 @@ def build_distribution(
             given, only the excess of today's dispersion over this average is added
             in quadrature to ``model_sigma`` (avoids double-counting the typical
             disagreement already inside ``model_sigma``). None → add full dispersion.
+        settlement_sigma_f: extra std (°F) for the grid→station settlement basis — the
+            difference between the forecast/ERA5 grid point and the NWS/ASOS station
+            Kalshi settles on, which the forecast spread does not capture. Added in
+            quadrature so the predictive distribution is honestly wider (and downstream
+            std_error larger). 0 → forecast and settlement instrument assumed identical.
     """
     if not point_highs:
         raise ValueError("need at least one point forecast")
@@ -108,7 +114,7 @@ def build_distribution(
         extra_var = max(0.0, dispersion**2 - mean_dispersion**2)
     else:
         extra_var = dispersion**2
-    sigma = float(np.sqrt(model_sigma**2 + extra_var))
+    sigma = float(np.sqrt(model_sigma**2 + extra_var + settlement_sigma_f**2))
 
     if residuals is not None and residuals.size >= 30:
         # Resample empirical residuals (predicted - realized), zero-centered and
@@ -177,18 +183,24 @@ def bucket_prob_and_se(
     floor_high: float | None = None,
     bias: float = 0.0,
     mean_dispersion: float | None = None,
+    settlement_sigma_f: float = 0.0,
+    structural_se: float = 0.0,
 ) -> tuple[float, float]:
     """Return ``(p, std_error)`` for a market's YES, folding both uncertainty terms.
 
     ``p`` is clamped into the open interval ``(0, 1)`` the Signal contract requires;
     a bucket that no draw hit is reported as ``~1/(2*n_draws)``, not 0 — an honest
-    "very unlikely, not impossible". ``bias``/``mean_dispersion`` are passed straight
-    through to :func:`build_distribution` (see there).
+    "very unlikely, not impossible". ``bias``/``mean_dispersion``/``settlement_sigma_f``
+    are passed straight through to :func:`build_distribution` (see there).
+    ``structural_se`` is an extra std added to the reported std_error (not the pmf) for
+    model uncertainty beyond sampling + center error — the Signal-contract way to report
+    structural uncertainty so the sizing engine shrinks a structurally-uncertain bet.
     """
     dist = build_distribution(
         point_highs, model_sigma=model_sigma, n_draws=n_draws,
         seed=seed, residuals=residuals, floor_high=floor_high,
         bias=bias, mean_dispersion=mean_dispersion,
+        settlement_sigma_f=settlement_sigma_f,
     )
     p = dist.prob_for_market(market)
 
@@ -200,13 +212,15 @@ def bucket_prob_and_se(
     shifted = [h + se_center for h in point_highs], [h - se_center for h in point_highs]
     p_hi = build_distribution(shifted[0], model_sigma=model_sigma, n_draws=n_draws,
                               seed=seed, residuals=residuals, floor_high=floor_high,
-                              bias=bias, mean_dispersion=mean_dispersion).prob_for_market(market)
+                              bias=bias, mean_dispersion=mean_dispersion,
+                              settlement_sigma_f=settlement_sigma_f).prob_for_market(market)
     p_lo = build_distribution(shifted[1], model_sigma=model_sigma, n_draws=n_draws,
                               seed=seed, residuals=residuals, floor_high=floor_high,
-                              bias=bias, mean_dispersion=mean_dispersion).prob_for_market(market)
+                              bias=bias, mean_dispersion=mean_dispersion,
+                              settlement_sigma_f=settlement_sigma_f).prob_for_market(market)
     param_se = abs(p_hi - p_lo) / 2.0
 
-    se = float(np.hypot(sampling_se, param_se))
+    se = float(np.sqrt(sampling_se**2 + param_se**2 + structural_se**2))
     p = clamp_prob(p, n_draws)
     return p, se
 

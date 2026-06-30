@@ -160,6 +160,59 @@ def nws_forecast(
     return ForecastRecord("nws", "nws-gridpoint", target_date, high, [])
 
 
+IEM_DAILY_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/daily.py"
+
+
+def iem_daily_max_f(
+    station: Station,
+    start: date,
+    end: date,
+    *,
+    ttl: float | None = None,
+) -> dict[str, float]:
+    """Realized daily-MAX (°F) per local day from the IEM ASOS archive.
+
+    This is the *settlement-instrument* truth: Iowa Environmental Mesonet republishes
+    the official NWS/ASOS station observations Kalshi settles a "high in city X" market
+    on — unlike ERA5 (a grid reanalysis that runs systematically off the station, e.g.
+    KMIA ~3°F on 2026-06-29). Used by :func:`hedge.weather.calibration.fit_calibration`
+    when ``truth="station"`` so the fitted bias absorbs the grid→station offset.
+
+    Returns ``{iso_date: max_f}``. Empty on any failure (missing ``iem_id``/network,
+    network error, no rows) so the caller can fall back to ERA5. Cached forever
+    (``ttl=None``) like the other archives, for reproducibility.
+    """
+    iem_id = getattr(station, "iem_id", None)
+    network = getattr(station, "iem_network", None)
+    if not iem_id or not network:
+        return {}
+    # IEM daily.py wants the date range as split year/month/day fields and returns a
+    # top-level JSON array of {station, day, max_temp_f} rows (verified live 2026-06).
+    params = {
+        "network": network,
+        "stations": iem_id,
+        "var": "max_temp_f",
+        "format": "json",
+        "year1": start.year, "month1": start.month, "day1": start.day,
+        "year2": end.year, "month2": end.month, "day2": end.day,
+    }
+    key = f"iem-daily:{station.series}:{iem_id}:{start}:{end}"
+    data = _get_json(IEM_DAILY_URL, params, key, ttl)
+    # Response is a bare list; older/alt shapes wrap it under "data".
+    rows = data if isinstance(data, list) else (data or {}).get("data", [])
+    out: dict[str, float] = {}
+    for row in rows or []:
+        day = row.get("day") or row.get("date")
+        hi = row.get("max_temp_f")
+        if day is None or hi is None:
+            continue
+        try:
+            out[str(day)[:10]] = float(hi)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def nws_recent_temps_f(
     station: Station,
     target_date: date,
