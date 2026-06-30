@@ -90,7 +90,7 @@ the volume, so the older image inherits any halt state.
 | `KALSHI_PRIVATE_KEY` | PEM contents (not path) from `secrets/kalshi_prod_private_key.pem` |
 | `KALSHI_ENV` | `prod` |
 | `KALSHI_BASE_URL` | `https://api.elections.kalshi.com/trade-api/v2` |
-| `HEDGE_ALERT_URL` | ntfy/Pushover/Slack webhook for push alerts |
+| `HEDGE_ALERT_URL` | ntfy/Pushover/Slack/Telegram webhook (single URL, comma-sep list, or configure `alerts.channels` / `alerts.url` in config) for push alerts |
 
 ---
 

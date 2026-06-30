@@ -71,3 +71,23 @@ guard:
   skill_min_samples: 30
   skill_full_at: 0.02      # Brier-skill margin (market - model) for full size
   skill_floor: 0.10        # λ multiplier before skill is proven (small bootstrap)
+
+# Push notifications (ntfy, Slack, Pushover, Telegram, generic webhooks).
+# Best-effort; never blocks trading. Legacy HEDGE_ALERT_URL still works.
+# For multiple channels use the "channels" list (or comma-sep in url).
+alerts:
+  enabled: true
+  # Simple single-channel (or "url1,url2" for quick multi):
+  # url: https://ntfy.sh/your-hedge-topic-here
+  #
+  # Recommended for richer setups:
+  # channels:
+  #   - https://ntfy.sh/your-hedge-topic-here
+  #   - type: slack
+  #     url: https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX
+  #   - type: pushover
+  #     token: your-app-token
+  #     user: your-user-key
+  #   - type: telegram
+  #     bot_token: 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
+  #     chat_id: "123456789"
