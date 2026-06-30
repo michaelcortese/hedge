@@ -59,3 +59,77 @@ or trusting the ramp on real money.
 
 See the full tournament output for honorable mentions (maker-only convergence, joint
 categorical Kelly, adverse-selection guard, decorrelated vendors, °C→°F lattice).
+
+---
+
+# Quant review (2026-06-30) — action items
+
+Four-reviewer review (alpha/edge · risk-engine audit · proposed-changes ·
+adversarial red-team) of the strategy + a proposed "more active intraday / salvage
+losers" change, with direct code verification. **Headline: no edge has been measured
+against the market price; the only plausible edge (deterministic obs-lag NO) is tiny,
+capacity-limited, and unproven. Do NOT make the bot more active until P1+P2 clear.**
+Engine arithmetic is clean (no sign/fee/idempotency bugs) — the issues are
+calibration, inputs, and proof, not the math.
+
+## P1 — correctness & honest σ (do first)
+- [ ] **Nowcast must fold in `settlement_sigma`.** Verified gap: `weather_nowcast.py:132`
+      calls `bucket_prob_and_se` WITHOUT `settlement_sigma_f` (cf. `weather_ensemble.py:80`).
+      Roadmap #1 added the settlement-basis term to ensemble but not to the one strategy
+      carrying size → its probabilistic buckets are overconfident (Jun-29 failure mode).
+      Deterministic trades (`std_error=1e-6`) are unaffected; this is the probabilistic path.
+- [ ] **`nws_recent_temps_f` local-day filter** (already noted L54-56). Re-confirmed:
+      queries from `{date}T00:00:00+00:00` (UTC midnight = prior local evening) and appends
+      every obs with no timestamp filter. **Low live risk** (nowcast `min_hour=14` → today's
+      daytime max usually dominates), but a real latent bug and it **corrupts backtest/replay**
+      of `obs_max`. Filter obs to the target local day (station tz).
+- [ ] **Validate IEM/station == Kalshi settlement, then flip `HEDGE_CALIBRATE_AGAINST=station`**
+      (already tracked L51-53; bump priority). Prod currently runs `truth=era5` *by design*
+      (station-truth gated until validated) — but ERA5≠settlement is the documented Jun-29
+      basis cause, so closing this is the single biggest risk reduction. Extend
+      `scripts/validate_stations.py` over the resolved-settlement set first.
+- [ ] **Move skill-gate / kill-switch evidence onto `/data`** (already tracked L48-50; bump
+      priority). Verified: guard reads `self.state` = `LIVE_DIR/hedge.db` (`runner.py:52`,
+      ephemeral), wiped every redeploy (2× in 4 min on 2026-06-30) → `skill_mult` frozen at
+      the 0.10 floor, Brier kill-switch can never reach its 20/30 samples. Safety machinery
+      + λ-ramp are effectively inert until this is durable.
+
+## P2 — prove the edge before any size increase
+- [ ] **Run `score_skill_vs_market` on ≥30 settled acted-on nowcast signals**, segmented
+      deterministic vs probabilistic. Today it has **zero data** — edge-vs-price is literally
+      unmeasured. Expectation to falsify: probabilistic skill ≈ 0 (model == mid); all skill is
+      in deterministic rows → then the real question is transactable **depth** after the ~1¢ fee.
+- [ ] **Stay paper-only / deterministic-NO-only until P1+P2 clear.** Collect the calibration
+      set at $0 risk via `run_paper.py` rather than paying the correlated tail to gather it.
+
+## P3 — the one defensible behavior change (low value; AFTER P1)
+- [ ] **Edge-checked exit leg** (rebuild of "let it cut losers"; the rest of the proposed
+      change is rejected below). Verified: in `decide()` the band/significance/`tau_min`/λ-floor
+      gates (`engine.py` L261-360) all return HOLD *before* `_reconcile` (L378) and evaluate the
+      opposite-side BUY (wrong leg), so non-deterministic losers can't be trimmed. Add an exit
+      check that runs **ahead of** the open pipeline, gated on `manage_positions`:
+      sells the **held** side on its own bid economics, **not** λ-scaled (full lot), bypasses
+      the open-only band+significance gates, but **keeps** `held_bid − fair_value(held) − taker_fee
+      ≥ tau_exit` (never sell a +EV hold; settlement is free). No-bid ⇒ no-op (dead buckets are
+      unrecoverable). Reuse the `manage_cooldown_cycles=2` cooldown; prefer nowcast-driven exits.
+      **Validate in paper vs hold-to-settlement (fee-net) before arming.** Also fix the misleading
+      "exits are band-exempt" comments (`engine.py:299`, `deploy/config.yaml:41`, `signal.py:44-48`).
+
+## WONT — rejected by the review (recorded so we don't revisit)
+- **Stop-loss on win-prob/MTM threshold** — −EV "+EV-sale trap": dumping a NO the model rates
+  26% at a 5¢ bid realizes a loss the model says not to take. The only defensible stop is
+  "model-EV at the bid < 0", which is just the P3 exit leg.
+- **Correlation-aware trim (standalone)** — backwards: holding NO across mutually-exclusive
+  buckets means at most ONE loses and the rest WIN; trimming sells winners. The correlated
+  case (YES across adjacent buckets) is already capped at open by `event_cap_frac=0.06`.
+- **Open more / raise `portfolio_cap` / lower skill floor** — most dangerous; pours size into
+  an unproven, mis-calibrated model right where it lost ~40% on Jun-29. "0 trades, over the
+  cap" is the safety machinery working as designed, not a defect.
+
+## Watch (not yet actionable)
+- **Daily-loss stop is porous to correlated settlement:** the `$15` stop only gates *future*
+  orders on *already-realized* P&L, but a city-day's buckets settle together in one cycle and
+  blow through it. Real bound is `event_cap_frac × 4 cities ≈ 24%` of bankroll in one evening.
+  Consider a pre-trade correlated-exposure cap if going live at size.
+- All four settlement stations are `validated=True` (`stations.py:64-67`) — station-map risk is
+  low; the live basis risk is the calibration default (P1), not the map.
