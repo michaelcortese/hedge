@@ -138,6 +138,7 @@ hedge/
     base.py              # Strategy ABC + MarketView — your interface
     example_coinflip.py  # copy this to start a new strategy
     weather_*.py         # temperature-hedge strategies (see below)
+    speech_mention.py    # word/phrase-mention strategy (see below)
     <your_strategy>.py   # <- you add files here
   weather/               # shared data + Monte Carlo core for temp strategies
     stations.py          # Kalshi series -> NWS settlement station (settlement-critical)
@@ -147,6 +148,11 @@ hedge/
     distribution.py      # MC: forecasts -> predictive distribution -> bucket P(YES)
     calibration.py       # fit forecast-error spread per city/lead
     sources.py           # ForecastSource seam (live vs archive/intraday replay)
+  speech/                # shared base-rate core for word/phrase-mention markets
+    markets.py           # parse a mention market title into a MentionMarket
+    corpus.py            # transcript-provider seam -> weighted CorpusStats (recency/event wt)
+    model.py             # Beta-Binomial base rate -> P(>=1 mention) + honest std error
+    config.py            # load per-provider API keys (config.speech.yaml / secrets/)
   tournament/            # compare strategies: backtest + paper P&L
     backtest.py          # grade strategies vs realized highs over history
     report.py            # Brier/log-loss/CRPS/calibration/skill leaderboard
@@ -164,7 +170,9 @@ hedge/
   alerts.py              # push notifications (ntfy/Pushover/Slack/Telegram + generic), best-effort; scaffold supports multi-channel via alerts.channels / comma-sep URLs and pluggable Notifiers
   runner.py              # main loop: signals -> decide -> execute (dry-run default)
 config.example.yaml      # copy to config.yaml (gitignored) and fill in
+config.speech.example.yaml  # copy to config.speech.yaml/secrets/ — speech-corpus API keys
 scripts/test_auth.py     # auth smoke test (offline + optional live)
+scripts/demo_speech.py   # speech_mention smoke test (no creds; FAKE demo corpus)
 scripts/run_backtest.py  # historical tournament -> leaderboard (no creds needed)
 scripts/run_paper.py     # paper tournament: snapshot/loop/score/edge (+ --prod read-only)
 scripts/run_live.py      # the trading loop (dry-run by default; --live to arm)
@@ -232,6 +240,45 @@ can't beat `weather_climatology` on Brier/log-loss is not enabled for size. The
 **#1 correctness risk is the settlement-station map** in `weather/stations.py`
 (`validated=False` rows are unverified) — a wrong station yields a confident-but-
 biased `p`, which Kelly punishes hard.
+
+## Word/mention markets (`speech_mention`) — PROTOTYPE, paper-only
+
+`speech_mention` bets on Kalshi "will <speaker> say '<phrase>' during <event>"
+markets. There is **no physical process to Monte-Carlo** — the signal is a *base
+rate* over comparable past speeches, so the core (`hedge/speech/`) is a Bayesian
+base-rate estimator, not a draw-simulator. The strategy file stays thin; the
+modeling lives in `speech/model.py`.
+
+**Model.** Each comparable past speech is a Bernoulli trial (`contained the
+phrase?`). A Beta(0.5, 0.5) prior + observing `k` hits in `n` speeches gives a
+posterior `Beta(α+k, β+n−k)`: mean → `prob` = P(≥1 mention), std → the sampling
+std error. Past speeches are weighted by **recency** (exponential half-life) ×
+**event-type similarity** (a rally is weak evidence for an FOMC presser), so
+`n_eff`/`k_eff` are weighted sums — a thin or off-type corpus widens the posterior
+honestly. A fixed `model_se_floor` (≈0.05) is added in quadrature so σ never
+collapses off a base rate alone (the *next* speech's propensity ≠ the long-run
+average; Kelly punishes that bias). It abstains on: no phrase parsed, unknown
+speaker, or `n_eff < min_eff_n`.
+
+**Data seam.** `speech/corpus.py` gathers past speeches from pluggable
+`TranscriptProvider` adapters behind one `MentionCorpus`. Enabled providers come
+from a keys file — copy `config.speech.example.yaml` to `config.speech.yaml` or
+`secrets/speech_apis.yaml` (or set `HEDGE_SPEECH_<PROVIDER>_KEY` env vars). Status:
+`in_memory` works (ships a **FAKE** demo corpus); `factbase` (Roll Call — best for
+politicians), `congress_gov`, `newsapi`, `gdelt` are scaffolds with real endpoints
+but a `_parse` TODO — they degrade to "no records", never fabricate.
+
+Smoke-test the pipeline (no creds, FAKE corpus):
+```bash
+.venv/bin/python scripts/demo_speech.py
+```
+
+**NOT enabled for size.** It is **not registered in `runner.py`** and falls back to
+the FAKE demo corpus until a real transcript source is wired *and* it clears a
+calibration backtest — same bar as weather. The **#1 correctness risks** are (a) the
+title parser in `speech/markets.py` (the phrase is in the market title, not the
+ticker — harden its regex against a real payload) and (b) an un-validated/biased
+corpus yielding a confident-wrong base rate. Keep it paper-only until graded.
 
 ---
 
