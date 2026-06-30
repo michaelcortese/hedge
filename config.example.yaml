@@ -72,6 +72,15 @@ guard:
   skill_full_at: 0.02      # Brier-skill margin (market - model) for full size
   skill_floor: 0.10        # λ multiplier before skill is proven (small bootstrap)
 
+# Market + weather research dataset. Each cycle appends the raw GET /markets payload +
+# order book per market and the raw Open-Meteo/NWS payloads per station to the durable
+# log at $HEDGE_STATE_DIR/marketdata/data_YYYY-MM-DD.jsonl — the inputs the model saw,
+# for replay/backtest. A separate stream from the trade event log, retention-capped
+# (it's the bulk). Read it: `python -m hedge.eventlog data count|tail`.
+marketdata:
+  enabled: true            # set false to stop capturing the raw market/weather inputs
+  retention_days: 30       # keep this many days of raw files; older day-files are pruned
+
 # Push notifications (ntfy, Slack, Pushover, Telegram, generic webhooks).
 # Best-effort; never blocks trading. Legacy HEDGE_ALERT_URL still works.
 # For multiple channels use the "channels" list (or comma-sep in url).

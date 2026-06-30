@@ -81,12 +81,13 @@ class EventLog:
     directory are created lazily on the first successful :meth:`emit`.
     """
 
-    def __init__(self, dir: str | Path | None = None):
+    def __init__(self, dir: str | Path | None = None, *, prefix: str = "events"):
         self.dir = Path(dir) if dir is not None else default_event_dir()
+        self.prefix = prefix
 
     def _path_for(self, ts_iso: str) -> Path:
-        """Day-partitioned file for an ISO timestamp (``events_YYYY-MM-DD.jsonl``)."""
-        return self.dir / f"events_{ts_iso[:10]}.jsonl"
+        """Day-partitioned file for an ISO timestamp (``<prefix>_YYYY-MM-DD.jsonl``)."""
+        return self.dir / f"{self.prefix}_{ts_iso[:10]}.jsonl"
 
     def emit(self, event_type: str, payload: dict | None = None, *,
              seq: int | None = None, ts: str | None = None) -> None:
@@ -114,6 +115,39 @@ class EventLog:
         """Yield this day's events in order (skips a corrupt/partial trailing line)."""
         yield from iter_events(self._path_for(utc_date + "T"))
 
+    def files(self) -> list[Path]:
+        """This log's day-partition files (``<prefix>_*.jsonl``), oldest first."""
+        return sorted(self.dir.glob(f"{self.prefix}_*.jsonl"))
+
+    def read_all(self) -> list[dict]:
+        """Every event across this log's day files, ordered by (file, line)."""
+        out: list[dict] = []
+        for p in self.files():
+            out.extend(iter_events(p))
+        return out
+
+    def prune(self, keep_days: int) -> list[Path]:
+        """Retention cap: delete all but the newest ``keep_days`` day-files.
+
+        Day files sort lexically == chronologically (``<prefix>_YYYY-MM-DD.jsonl``), so
+        the tail is the most recent. Only ever removes whole *older* day files — never
+        the current day's, never partial lines — so it stays append-safe. ``keep_days
+        <= 0`` disables pruning (keep everything). Best-effort: never raises.
+        """
+        removed: list[Path] = []
+        if keep_days <= 0:
+            return removed
+        try:
+            for p in self.files()[:-keep_days]:
+                try:
+                    p.unlink()
+                    removed.append(p)
+                except OSError as e:
+                    print(f"[eventlog] prune failed for {p.name} ({e})", flush=True)
+        except Exception as e:  # noqa: BLE001 — retention must never crash a cycle
+            print(f"[eventlog] prune error ({type(e).__name__}: {e})", flush=True)
+        return removed
+
 
 def iter_events(path: str | Path) -> Iterator[dict]:
     """Yield parsed events from one JSONL file, skipping blank/corrupt lines.
@@ -133,27 +167,47 @@ def iter_events(path: str | Path) -> Iterator[dict]:
             continue
 
 
-def read_all(dir: str | Path | None = None) -> list[dict]:
-    """Read every event across all day files in ``dir``, ordered by (file, line)."""
+def read_all(dir: str | Path | None = None, *, prefix: str = "events") -> list[dict]:
+    """Read every event across all ``<prefix>_*.jsonl`` day files in ``dir``.
+
+    ``prefix`` selects the stream — ``"events"`` (trade/decision audit trail, the
+    default) or ``"data"`` (the market+weather research log under ``marketdata/``).
+    """
     d = Path(dir) if dir is not None else default_event_dir()
     out: list[dict] = []
-    for path in sorted(d.glob("events_*.jsonl")):
+    for path in sorted(d.glob(f"{prefix}_*.jsonl")):
         out.extend(iter_events(path))
     return out
 
 
+def default_data_dir() -> Path:
+    """Where the market+weather research log lives: ``$HEDGE_STATE_DIR/marketdata``."""
+    base = Path(os.environ.get("HEDGE_STATE_DIR", "data/runs/live"))
+    return base / "marketdata"
+
+
 def _main(argv: list[str] | None = None) -> None:
-    """Tiny CLI: ``python -m hedge.eventlog [tail [N] | count]`` over the durable log."""
+    """Tiny CLI over the durable logs.
+
+    ``python -m hedge.eventlog [tail [N] | count]``        — the trade/decision log
+    ``python -m hedge.eventlog data [tail [N] | count]``   — the market+weather data log
+    """
     import sys
 
     args = list(argv if argv is not None else sys.argv[1:])
+    if args and args[0] == "data":          # select the market+weather stream
+        args = args[1:]
+        events = read_all(default_data_dir(), prefix="data")
+        where = default_data_dir()
+    else:
+        events = read_all()
+        where = default_event_dir()
     cmd = args[0] if args else "tail"
-    events = read_all()
     if cmd == "count":
         by_type: dict[str, int] = {}
         for e in events:
             by_type[e.get("type", "?")] = by_type.get(e.get("type", "?"), 0) + 1
-        print(f"{len(events)} events in {default_event_dir()}")
+        print(f"{len(events)} events in {where}")
         for t, n in sorted(by_type.items(), key=lambda kv: -kv[1]):
             print(f"  {n:>6}  {t}")
         return
