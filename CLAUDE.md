@@ -161,7 +161,7 @@ hedge/
   guard.py               # calibration kill-switch: halt if realized Brier drifts
   state.py               # durable SQLite state (orders, fills, decisions, daily P&L) — crash-safe
   eventlog.py            # append-only JSONL audit trail on the DURABLE volume (/data) — survives redeploys that wipe hedge.db
-  alerts.py              # push notifications (ntfy/Pushover/Slack), best-effort
+  alerts.py              # push notifications (ntfy/Pushover/Slack/Telegram + generic), best-effort; scaffold supports multi-channel via alerts.channels / comma-sep URLs and pluggable Notifiers
   runner.py              # main loop: signals -> decide -> execute (dry-run default)
 config.example.yaml      # copy to config.yaml (gitignored) and fill in
 scripts/test_auth.py     # auth smoke test (offline + optional live)

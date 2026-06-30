@@ -68,3 +68,9 @@ guard:
   skill_min_samples: 30
   skill_full_at: 0.02
   skill_floor: 0.10
+
+# Alerts are delivered via the HEDGE_ALERT_URL Fly secret (env).
+# This section is mostly for local docs / reference. Multi-channel scaffold
+# supported (comma in HEDGE_ALERT_URL or alerts.channels list).
+alerts:
+  enabled: true
