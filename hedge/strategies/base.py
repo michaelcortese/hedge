@@ -63,6 +63,47 @@ class MarketView:
             return (b + a) / 2
         return self.last_price
 
+    def book_top(self) -> dict | None:
+        """Best bid/ask and resting depth from the order book, in DOLLARS.
+
+        Kalshi's ``GET /markets/{ticker}/orderbook`` returns BIDS ONLY on both sides:
+        ``{"orderbook": {"yes": [[price_cents, count], ...], "no": [[...]]}}`` (each a
+        resting-bid ladder). The best YES bid is the highest yes price; the YES ask is
+        reconstructed as ``1 - best_no_bid`` (see CLAUDE.md). Returns dollars plus the
+        contract depth resting at each best level, or None if the book wasn't fetched
+        or carries no priced level. Keeps the raw-book shape parsing in one place so
+        strategies and the decision engine read a consistent top-of-book.
+        """
+        ob = self.orderbook or {}
+        ob = ob.get("orderbook", ob) if isinstance(ob, dict) else {}
+        if not isinstance(ob, dict):
+            return None
+
+        def _best_bid(levels) -> tuple[float | None, int | None]:
+            best_c, best_d = None, None
+            for lvl in levels or []:
+                if not lvl:
+                    continue
+                px = lvl[0]
+                ct = lvl[1] if len(lvl) > 1 else None
+                if px is None:
+                    continue
+                if best_c is None or px > best_c:
+                    best_c, best_d = px, ct
+            return best_c, best_d
+
+        yb_c, yb_d = _best_bid(ob.get("yes"))
+        nb_c, nb_d = _best_bid(ob.get("no"))
+        if yb_c is None and nb_c is None:
+            return None
+        return {
+            "yes_bid": yb_c / 100 if yb_c is not None else None,
+            "yes_bid_depth": int(yb_d) if yb_d is not None else None,
+            "yes_ask": (100 - nb_c) / 100 if nb_c is not None else None,
+            "no_bid": nb_c / 100 if nb_c is not None else None,
+            "no_bid_depth": int(nb_d) if nb_d is not None else None,
+        }
+
 
 class Strategy(ABC):
     """Subclass this for each Monte Carlo algorithm.

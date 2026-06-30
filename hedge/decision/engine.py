@@ -92,13 +92,37 @@ class MarketQuote:
     def from_view(cls, view: Any) -> "MarketQuote | None":
         """Build from a ``MarketView`` (or anything exposing yes_bid/yes_ask).
 
-        Returns None if either side of the book is missing — you can't price a
-        trade without a two-sided market.
+        Prefers the actual order book (``view.book_top()``) when present: it gives
+        the true top-of-book (``yes_ask = 1 - best_no_bid``, reconstructed from the
+        bids-only Kalshi book) and the resting depth on each side, which the depth /
+        participation caps in :func:`decide` need. Falls back to the stale
+        ``GET /markets`` top-of-book fields when the book wasn't fetched.
+
+        Returns None when there is no two-sided, tradeable market: a missing side, or
+        a locked/crossed book (``yes_bid >= yes_ask``) — neither can be priced or
+        filled, and taking it literally manufactures a phantom edge sizing bets into.
         """
-        yb, ya = view.yes_bid, view.yes_ask
+        book = view.book_top() if hasattr(view, "book_top") else None
+        depths: dict[str, int | None] = {}
+        if book is not None:
+            yb = book.get("yes_bid")
+            ya = book.get("yes_ask")
+            # Buying YES as taker lifts the best NO bid; joining the YES bid rests
+            # behind the resting YES size. NO side mirrors. (See CLAUDE.md book note.)
+            depths = {
+                "yes_bid_depth": book.get("yes_bid_depth"),
+                "yes_ask_depth": book.get("no_bid_depth"),
+                "no_bid_depth": book.get("no_bid_depth"),
+                "no_ask_depth": book.get("yes_bid_depth"),
+            }
+        else:
+            yb, ya = view.yes_bid, view.yes_ask
         if yb is None or ya is None:
             return None
-        return cls(yes_bid=float(yb), yes_ask=float(ya))
+        yb, ya = float(yb), float(ya)
+        if yb >= ya:  # locked or crossed book — not a fillable two-sided market
+            return None
+        return cls(yes_bid=yb, yes_ask=ya, **depths)
 
 
 @dataclass(frozen=True)
@@ -190,6 +214,7 @@ def decide(
     *,
     position: Position | None = None,
     portfolio_at_risk: float = 0.0,
+    event_at_risk: float = 0.0,
 ) -> Decision:
     """Turn one ``Signal`` + ``MarketQuote`` into an order decision.
 
@@ -202,6 +227,10 @@ def decide(
         portfolio_at_risk: dollars already at risk across all markets, for the
             portfolio cap. The order is shrunk so the total stays within
             ``portfolio_cap * bankroll``.
+        event_at_risk: dollars already at risk across the OTHER buckets of this
+            market's event (same city-day), for the per-event concentration cap.
+            The order is shrunk so this event's total stays within
+            ``event_cap_frac * bankroll`` (correlated-risk ceiling).
 
     Returns a ``Decision``. ``action == HOLD`` (with a ``reason``) when the engine
     declines to trade.
@@ -293,21 +322,32 @@ def decide(
     # (7) Caps. Each is a ceiling on dollars-at-risk; take the binding one.
     market_capital = cfg.market_cap_frac * bankroll
     portfolio_room = max(0.0, cfg.portfolio_cap * bankroll - portfolio_at_risk)
+    # Per-event (city-day) room: all buckets of one event are correlated, so cap the
+    # combined risk across them, not just per-bucket. event_at_risk is what the other
+    # buckets of this event already hold.
+    event_room = max(0.0, cfg.event_cap_frac * bankroll - event_at_risk)
     abs_cap = cfg.max_order_dollars if cfg.max_order_dollars is not None else math.inf
-    capital = min(target_capital, market_capital, portfolio_room, abs_cap)
+    capital = min(target_capital, market_capital, portfolio_room, event_room, abs_cap)
     if capital <= 0:
-        return _hold(ticker, "portfolio cap leaves no room", edge=cons_edge, **base)
+        reason = ("event cap leaves no room" if event_room <= portfolio_room
+                  else "portfolio cap leaves no room")
+        return _hold(ticker, reason, edge=cons_edge, **base)
 
     count = int(math.floor(capital / exec_price))
 
-    # Order-book-depth cap: never size past what's resting at our price.
+    # Order-book-depth cap: never size past what's resting at our price. With
+    # participation_frac set, take only that fraction of the resting level so a large
+    # Kelly target is split/shrunk instead of walking the book and signalling size.
     depth = (
         (quote.yes_bid_depth if maker else quote.yes_ask_depth)
         if side is Side.YES
         else (quote.no_bid_depth if maker else quote.no_ask_depth)
     )
     if depth is not None:
-        count = min(count, int(depth))
+        allowed = int(depth)
+        if cfg.participation_frac is not None:
+            allowed = int(math.floor(cfg.participation_frac * depth))
+        count = min(count, allowed)
 
     if count < 1:
         return _hold(ticker, "sized below one contract", edge=cons_edge, **base)

@@ -34,6 +34,12 @@ class Station:
     #: Set False until the (series, station) pair has been checked against a
     #: resolved Kalshi market. Strategies refuse real size on unvalidated stations.
     validated: bool = False
+    #: IEM ASOS station id + state network for the settlement-instrument truth source
+    #: (``providers.iem_daily_max_f`` / station-truth calibration). Empty network
+    #: disables the IEM lookup (ERA5 fallback). Validate IEM max == resolved Kalshi
+    #: settlement before trusting it for real size.
+    iem_id: str = ""
+    iem_network: str = ""
 
 
 # Start narrow: a few high-liquidity cities (per the approved plan). Expand only
@@ -50,11 +56,15 @@ class Station:
 # raw ASOS observed max (KNYC 57% vs KLGA 86%); that disagreed with the CLI Daily
 # report by exactly the rounding/conversion nuance the market rules warn about.
 # Against the correct instrument (CLI), KNYC/Central Park is unambiguous — 14/14.
+# iem_id/iem_network: the IEM ASOS handle for the *settlement-instrument* truth source
+# (providers.iem_daily_max_f), i.e. the nws_station without its leading "K", on the
+# state ASOS network. Used only by station-truth calibration; must be validated against
+# resolved Kalshi settlements before it drives real size (see fit_calibration truth=).
 _STATION_LIST: list[Station] = [
-    Station("KXHIGHNY", "New York City", "KNYC", 40.78, -73.97, "America/New_York", validated=True),
-    Station("KXHIGHCHI", "Chicago", "KMDW", 41.79, -87.75, "America/Chicago", validated=True),
-    Station("KXHIGHMIA", "Miami", "KMIA", 25.79, -80.29, "America/New_York", validated=True),
-    Station("KXHIGHAUS", "Austin", "KAUS", 30.19, -97.67, "America/Chicago", validated=True),
+    Station("KXHIGHNY", "New York City", "KNYC", 40.78, -73.97, "America/New_York", validated=True, iem_id="NYC", iem_network="NY_ASOS"),
+    Station("KXHIGHCHI", "Chicago", "KMDW", 41.79, -87.75, "America/Chicago", validated=True, iem_id="MDW", iem_network="IL_ASOS"),
+    Station("KXHIGHMIA", "Miami", "KMIA", 25.79, -80.29, "America/New_York", validated=True, iem_id="MIA", iem_network="FL_ASOS"),
+    Station("KXHIGHAUS", "Austin", "KAUS", 30.19, -97.67, "America/Chicago", validated=True, iem_id="AUS", iem_network="TX_ASOS"),
 ]
 
 STATIONS: dict[str, Station] = {s.series: s for s in _STATION_LIST}

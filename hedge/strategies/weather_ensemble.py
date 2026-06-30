@@ -62,6 +62,13 @@ class WeatherEnsembleStrategy(Strategy):
         bias = self.calibration.bias_for(tm.series, lead)
         mean_disp = self.calibration.dispersion_for(tm.series, lead)
 
+        # Fold the grid→station settlement basis into the spread: this is a pure
+        # forecast-grid estimate, so the difference between the forecast point and the
+        # NWS/ASOS station Kalshi settles on is real, uncaptured uncertainty. (The
+        # nowcast does NOT add this — its obs floor is already read off the settlement
+        # station, so it would be a double penalty there.)
+        settle_sigma = self.calibration.settlement_sigma_for(tm.series)
+
         p, se = bucket_prob_and_se(
             highs, tm,
             model_sigma=sigma,
@@ -70,6 +77,7 @@ class WeatherEnsembleStrategy(Strategy):
             residuals=residuals,
             bias=bias,
             mean_dispersion=mean_disp,
+            settlement_sigma_f=settle_sigma,
         )
         return Signal(
             ticker=tm.ticker,
@@ -84,6 +92,7 @@ class WeatherEnsembleStrategy(Strategy):
                 "n_models": len(highs),
                 "model_highs": [round(h, 1) for h in highs],
                 "model_sigma": round(sigma, 2),
+                "settlement_sigma": round(settle_sigma, 2),
                 "bucket": [tm.lo_f, tm.hi_f],
             },
         )

@@ -51,9 +51,44 @@ from hedge.weather.stations import STATIONS, station_for_ticker
 LIVE_DIR = Path("data/runs/live")
 
 
+def _event_key(ticker: str) -> str:
+    """Group key for one Kalshi event (city-day): the series + date code, e.g.
+    ``KXHIGHMIA-26JUN30`` from ``KXHIGHMIA-26JUN30-B93.5``. All buckets of a city-day
+    share this key, so the engine can cap their combined (correlated) risk."""
+    return "-".join(ticker.split("-")[:2])
+
+
+def _live_calibration() -> CalibrationTable:
+    """Fit per-city forecast-error spread/bias for live trading, with a safe fallback.
+
+    The live bot previously ran with an EMPTY table — prior σ and ZERO bias correction,
+    so the systematic grid→station settlement offset went uncorrected. We fit the same
+    way the paper tournament does (recent disjoint window, ERA5-lag aware), honoring
+    HEDGE_CALIBRATE_AGAINST (era5|station) for the truth source. Any failure (offline
+    container, slow archive) falls back to the prior curve so a fit hiccup can never
+    stop the loop. The σ floor inside fit_calibration prevents the correlated-source
+    collapse regardless of truth source.
+    """
+    truth = os.environ.get("HEDGE_CALIBRATE_AGAINST", "era5").strip().lower()
+    try:
+        from datetime import timedelta
+
+        from hedge.weather.calibration import fit_calibration
+        end = datetime.now(ZoneInfo("UTC")).date() - timedelta(days=7)  # ERA5 lags ~5d
+        start = end - timedelta(days=45)
+        table = fit_calibration(list(STATIONS.values()), start, end, truth=truth)
+        fitted = sorted({s for (s, _lead) in table.sigma})
+        print(f"[calib] fit {start}..{end} truth={truth}; "
+              f"calibrated series: {fitted or 'none (using priors)'}", flush=True)
+        return table
+    except Exception as e:  # noqa: BLE001 — never let calibration block trading
+        print(f"[calib] fit failed ({type(e).__name__}: {e}); using priors.", flush=True)
+        return CalibrationTable()
+
+
 def _default_strategies() -> list[Strategy]:
     src = LiveForecastSource()
-    calib = CalibrationTable()
+    calib = _live_calibration()
     # NOTE: weather_climatology is deliberately EXCLUDED from live trading — it is the
     # null benchmark every real strategy must beat in the tournament, not an alpha
     # source. Trading it with real money would bet the baseline. It stays in the
@@ -169,10 +204,28 @@ class Runner:
         for series in STATIONS:
             try:
                 for raw in discover_temp_markets(self.client, series, status="open"):
-                    views.append(MarketView(raw.get("ticker", ""), raw))
+                    ticker = raw.get("ticker", "")
+                    views.append(MarketView(ticker, raw, orderbook=self._orderbook(ticker)))
             except Exception as e:  # noqa: BLE001
                 print(f"[runner] market discovery failed for {series} ({e})", flush=True)
         return views
+
+    def _orderbook(self, ticker: str) -> dict | None:
+        """Fetch the order book for one ticker (best-effort).
+
+        The engine's depth / participation caps and book-reconstructed top-of-book
+        need the real ladder; without it those caps are dead code and sizing is blind
+        to liquidity. A fetch failure returns None so the engine falls back to the
+        stale GET /markets quote rather than aborting the cycle. Reads are cheap and
+        well under the Basic-tier ~20 reads/s limit for our small (4-city) universe.
+        """
+        if not ticker:
+            return None
+        try:
+            return self.client.get_orderbook(ticker)
+        except Exception as e:  # noqa: BLE001 — book is best-effort; degrade gracefully
+            print(f"[runner] orderbook fetch failed for {ticker} ({e})", flush=True)
+            return None
 
     # ----- calibration kill-switch ------------------------------------------
     def _halt_file(self) -> Path:
@@ -332,8 +385,13 @@ class Runner:
             views += self._held_ticker_views(positions, covered)
         self._heartbeat(bankroll, positions)
 
-        # Capital already at risk in open positions seeds the portfolio cap.
+        # Capital already at risk in open positions seeds the portfolio cap, and —
+        # grouped by event (city-day) — the per-event concentration cap.
         portfolio_at_risk = sum(p.count * p.avg_price for p in positions.values())
+        event_at_risk: dict[str, float] = {}
+        for tk, p in positions.items():
+            event_at_risk[_event_key(tk)] = (
+                event_at_risk.get(_event_key(tk), 0.0) + p.count * p.avg_price)
 
         tickets: list[OrderTicket] = []
         decisions_log: list[dict] = []
@@ -341,7 +399,9 @@ class Runner:
             quote = MarketQuote.from_view(view)
             if quote is None:
                 continue
-            best = self._best_decision(view, quote, bankroll, positions, portfolio_at_risk)
+            ekey = _event_key(view.ticker)
+            best = self._best_decision(view, quote, bankroll, positions,
+                                       portfolio_at_risk, event_at_risk.get(ekey, 0.0))
             if best is None:
                 continue
             decision, strat = best
@@ -388,8 +448,10 @@ class Runner:
                 )
                 decision.meta["strategy"] = strat
             if decision.is_trade and decision.action is Action.BUY:
-                # Reserve capital so the portfolio cap holds across this cycle.
-                portfolio_at_risk += decision.count * decision.price
+                # Reserve capital so the portfolio and per-event caps hold across this cycle.
+                reserved = decision.count * decision.price
+                portfolio_at_risk += reserved
+                event_at_risk[ekey] = event_at_risk.get(ekey, 0.0) + reserved
             ticket = self.executor.place(
                 decision, idem_key=self._idem_key(decision),
             )
@@ -648,7 +710,8 @@ class Runner:
         st = station_for_ticker(ticker)
         return st is None or not st.validated
 
-    def _best_decision(self, view, quote, bankroll, positions, portfolio_at_risk):
+    def _best_decision(self, view, quote, bankroll, positions, portfolio_at_risk,
+                       event_at_risk=0.0):
         """Decide across all strategies for one market; return (decision, strategy).
 
         Picks the largest-edge tradable decision. If none trade, returns the first
@@ -667,7 +730,8 @@ class Runner:
             if sig is None:
                 continue
             d = decide(sig, quote, bankroll, self.cfg,
-                       position=position, portfolio_at_risk=portfolio_at_risk)
+                       position=position, portfolio_at_risk=portfolio_at_risk,
+                       event_at_risk=event_at_risk)
             d.meta["strategy"] = sig.strategy
             # Carry the model's own inputs (forecast, dispersion, bias, max-so-far)
             # so a decision row records *why* the prob was what it was.

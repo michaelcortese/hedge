@@ -17,9 +17,23 @@ class RiskConfig:
     k_sigma: float = 2.0            # require |p - mid| > k_sigma * sigma to act
     z_ci: float = 1.0              # conservative-edge CI haircut: use p ∓ z*sigma
     tau_min_cents: float = 2.0      # minimum net edge (cents) to trade
-    market_cap_frac: float = 0.03   # max bankroll fraction at risk per market
+    market_cap_frac: float = 0.03   # max bankroll fraction at risk per market (one bucket)
     portfolio_cap: float = 0.30     # max total bankroll fraction at risk
     rebalance_band: float = 0.25    # only rebalance if target drifts > this frac
+
+    # Per-EVENT (city-day) concentration cap. All buckets of one "high in city X on
+    # day D" event are mutually exclusive outcomes of ONE synoptic draw, so they are
+    # highly correlated: a biased forecast center misses them together (the 2026-06-29
+    # failure — ~11 correlated markets, 10 losses). market_cap_frac alone lets each
+    # bucket take its full share, so a whole event could consume many market-caps of
+    # correlated risk. This caps total dollars-at-risk across ALL buckets of one event.
+    event_cap_frac: float = 0.06    # max bankroll fraction at risk per (series, day)
+
+    # Order-book participation cap: never take more than this fraction of the size
+    # resting at our price in a single order (None = take the whole resting level, the
+    # legacy behavior). Caps market impact / book-walking and avoids signalling size on
+    # thin retail books. Requires the order book to be fetched (depth fields populated).
+    participation_frac: float | None = None
 
     # Tradeable-price band: refuse to OPEN a position whose execution price falls
     # outside [min_price, max_price] (dollars). Extreme contracts are where the
