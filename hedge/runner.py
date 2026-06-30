@@ -35,6 +35,7 @@ from zoneinfo import ZoneInfo
 from hedge import alerts
 from hedge.config import build_client
 from hedge.decision import Action, Decision, MarketQuote, Position, RiskConfig, Side, decide
+from hedge.eventlog import EventLog
 from hedge.execution import Executor, OrderTicket
 from hedge.execution.executor import parse_order
 from hedge.guard import GuardConfig, GuardStatus, assess, market_skill
@@ -107,7 +108,8 @@ class Runner:
                  *, bankroll_override: float | None = None,
                  guard_cfg: GuardConfig | None = None,
                  strategy_lambda: dict[str, float] | None = None,
-                 state: State | None = None):
+                 state: State | None = None,
+                 eventlog: EventLog | None = None):
         self.client = client
         self.strategies = strategies
         self.executor = executor
@@ -121,6 +123,13 @@ class Runner:
         self._skill_mult = 1.0   # refreshed each cycle when the skill gate is enabled
         # Durable state lives next to the decision logs (the Fly volume in prod).
         self.state = state if state is not None else State(LIVE_DIR / "hedge.db")
+        # Append-only audit trail on the DURABLE volume (HEDGE_STATE_DIR=/data in prod),
+        # separate from hedge.db so the historical record survives a redeploy that wipes
+        # the working DB. Every state mutation below also emits one event line here. The
+        # default base mirrors _write_status (HEDGE_STATE_DIR, else LIVE_DIR) so it lands
+        # on the durable volume in prod and tracks a monkeypatched LIVE_DIR in tests.
+        self.eventlog = eventlog if eventlog is not None else EventLog(
+            Path(os.environ.get("HEDGE_STATE_DIR", str(LIVE_DIR))) / "events")
 
     # ----- state from Kalshi -------------------------------------------------
     def bankroll(self) -> float:
@@ -256,6 +265,9 @@ class Runner:
         LIVE_DIR.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(ZoneInfo("UTC")).isoformat()
         self._halt_file().write_text(f"{stamp} {reason}\n")
+        # Durable record of the halt — the HALTED latch file lives on the ephemeral
+        # layer and is cleared by --reset-guard, so the event log is the lasting trail.
+        self.eventlog.emit("halt", {"reason": reason}, seq=getattr(self, "_cycle_seq", None))
 
     def _trip(self, status: GuardStatus) -> None:
         self._latch_halt(status.reason)
@@ -504,12 +516,15 @@ class Runner:
             tickets.append(ticket)
             decisions_log.append(self._log_row(decision, strat, ticket))
             # Canonical, queryable record of this decision in the DB (the learning
-            # substrate). Best-effort: a logging failure must never abort a cycle.
+            # substrate) AND an append-only event line on the durable volume. Both
+            # best-effort: a logging failure must never abort a cycle.
+            db_row = self._db_decision_row(
+                decision, strat, ticket, quote, view, bankroll, par_at_decision)
             try:
-                self.state.record_decision(self._db_decision_row(
-                    decision, strat, ticket, quote, view, bankroll, par_at_decision))
+                self.state.record_decision(db_row)
             except Exception as e:  # noqa: BLE001
                 print(f"[runner] state.record_decision failed ({e})", flush=True)
+            self.eventlog.emit("decision", db_row, seq=seq)
 
         self._write_log(decisions_log)
         self._write_status(bankroll, positions)
@@ -520,6 +535,26 @@ class Runner:
     def _record_ticket(self, ticket: OrderTicket) -> None:
         """Persist a placed order so fills/idempotency survive a restart."""
         d = ticket.decision
+        # Append-only record of EVERY trade ticket — placed, dry-run, or blocked — so
+        # the durable log shows attempts and rejections, not just successes. HOLDs are
+        # already captured by the decision event, so only log actual order intents here.
+        if d.is_trade:
+            self.eventlog.emit("order", {
+                "ticker": d.ticker,
+                "action": d.action.value,
+                "side": d.side.value if d.side else None,
+                "count": d.count,
+                "price_cents": d.price_cents,
+                "placed": bool(ticket.placed),
+                "dry_run": bool(ticket.dry_run),
+                "status": ticket.status,
+                "order_id": ticket.order_id,
+                "client_order_id": (ticket.body or {}).get("client_order_id"),
+                "fill_count": ticket.fill_count,
+                "error": ticket.error,
+                "reason": d.reason,
+                "strategy": d.meta.get("strategy"),
+            }, seq=getattr(self, "_cycle_seq", None))
         if not (ticket.placed and d.is_trade and d.side is not None):
             return
         coid = ticket.body.get("client_order_id")
@@ -652,6 +687,16 @@ class Runner:
                     row["client_order_id"], row["ticker"], row["side"], row["action"],
                     count, order_id=oid, avg_price_cents=avg,
                     fee_cents=a["fee"], status="executed")
+                self.eventlog.emit("fill", {
+                    "ticker": row["ticker"],
+                    "side": row["side"],
+                    "action": row["action"],
+                    "fill_count": count,
+                    "avg_price_cents": avg,
+                    "fee_cents": a["fee"],
+                    "order_id": oid,
+                    "client_order_id": row["client_order_id"],
+                }, seq=getattr(self, "_cycle_seq", None))
             except Exception as e:  # noqa: BLE001
                 print(f"[runner] record_fill failed for {oid} ({e})", flush=True)
 
@@ -665,7 +710,12 @@ class Runner:
         """
         for ticker in self.state.unsettled_fill_tickers():
             try:
-                self.state.book_intraday_realized(ticker)
+                delta = self.state.book_intraday_realized(ticker)
+                if delta:
+                    self.eventlog.emit("intraday_pnl", {
+                        "ticker": ticker, "delta": round(delta, 4),
+                        "realized_today": round(self.state.realized_today(), 4),
+                    }, seq=getattr(self, "_cycle_seq", None))
             except Exception as e:  # noqa: BLE001
                 print(f"[runner] book_intraday_realized failed for {ticker} ({e})", flush=True)
 
@@ -702,10 +752,18 @@ class Runner:
                 entry_c += acct["avg_cost_cents"][side] * net
                 held_side = side if held_side is None else "mixed"
             try:
-                self.state.book_settlement(
+                booked = self.state.book_settlement(
                     ticker, pnl, side=held_side,
                     entry_cents=(entry_c / net_total) if net_total else None,
                     count=net_total, outcome="yes" if won_yes else "no")
+                if booked:
+                    self.eventlog.emit("settlement", {
+                        "ticker": ticker, "pnl": round(pnl, 4),
+                        "side": held_side, "count": net_total,
+                        "entry_cents": round(entry_c / net_total, 2) if net_total else None,
+                        "outcome": "yes" if won_yes else "no",
+                        "realized_today": round(self.state.realized_today(), 4),
+                    }, seq=getattr(self, "_cycle_seq", None))
             except Exception as e:  # noqa: BLE001
                 print(f"[runner] book_settlement failed for {ticker} ({e})", flush=True)
 
@@ -716,6 +774,11 @@ class Runner:
             return
         self.state.set_meta("last_heartbeat_date", today)
         mode = "DRY-RUN" if self.executor.dry_run else f"LIVE[{self.executor.env}]"
+        self.eventlog.emit("heartbeat", {
+            "mode": mode, "bankroll": round(bankroll, 2),
+            "open_positions": len(positions),
+            "realized_today": round(self.state.realized_today(), 2),
+        }, seq=getattr(self, "_cycle_seq", None))
         alerts.notify(
             alerts.Level.INFO, "hedge: daily heartbeat",
             f"{mode} alive — bankroll ${bankroll:,.2f}, {len(positions)} open position(s), "
@@ -863,6 +926,12 @@ class Runner:
         placed = [t for t in trades if t.placed]
         mode = "DRY-RUN" if self.executor.dry_run else f"LIVE[{self.executor.env}]"
         now = datetime.now(ZoneInfo("UTC"))
+        self.eventlog.emit("cycle", {
+            "mode": mode, "bankroll": round(bankroll, 2),
+            "markets_checked": len(tickets),
+            "would_trade": len(trades), "placed": len(placed),
+            "skill_mult": round(self._skill_mult, 3),
+        }, seq=getattr(self, "_cycle_seq", None))
         print(
             f"[runner {mode}] {now:%Y-%m-%d %H:%M}Z bankroll=${bankroll:,.2f} "
             f"markets_checked={len(tickets)} would_trade={len(trades)} placed={len(placed)}",
