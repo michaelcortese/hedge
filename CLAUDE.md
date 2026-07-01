@@ -142,7 +142,7 @@ hedge/
   weather/               # shared data + Monte Carlo core for temp strategies
     stations.py          # Kalshi series -> NWS settlement station (settlement-critical)
     markets.py           # parse a temp market into bucket bounds (TempMarket)
-    providers.py         # free forecast/obs fetchers (Open-Meteo, NWS) + cache
+    providers.py         # free forecast/obs fetchers (Open-Meteo, NWS, IEM AFOS/CLI) + cache
     archive.py           # historical forecasts + ERA5 truth (backtest/climatology)
     distribution.py      # MC: forecasts -> predictive distribution -> bucket P(YES)
     calibration.py       # fit forecast-error spread per city/lead

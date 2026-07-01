@@ -131,6 +131,19 @@ slots in as a second, authoritative `observed_max` source in
 `hedge/weather/sources.py` — highest-trust floor when present, ASOS obs as the
 fallback between issuances.
 
+*Status: implemented on this branch. `providers.iem_cli_max_so_far_f` (AFOS list for
+the target UTC day + the next, immutable per-product text fetch, strict
+date/section/range parsing, corrections supersede rather than max, best-effort on IEM
+failure) is blended into `LiveForecastSource.observed_max` with a plausibility guard
+(a CLI value >5°F above every raw ob from the same sensor is a parse/station mix-up —
+keep the obs floor). Live check on 2026-07-01, first cycle after the 20:36Z NYC
+issuance: **NYC CLI floor 93°F vs raw-METAR max 91°F** — the official floor ran 2°F
+sharper on day one, i.e. two more price levels of deterministic NO; CHI (no issuance
+yet) and MIA/AUS (obs fresher than the issuance) all fell back correctly. Remaining
+from this item: fit per-city post-issuance new-high rates from the archive, which
+prices the 4:40pm–close window the floor opens up (and enables the post-CLI making
+idea).*
+
 ## P2 — Model-free event-strip arbitrage
 
 The buckets of one city-day event are mutually exclusive and exhaustive, so a strip of
@@ -289,9 +302,10 @@ first.
 | ✅ | Local-day + QC filter in `nws_recent_temps_f` | bug fix | S | Done — false floors (wrong day, glitched sensor) can't reach the flagship trade |
 | ✅ | Deterministic window runs all day | unlock | S | Done — frontal-day morning locks were invisible before 2pm |
 | ✅ | Deterministic signals cross, don't rest | leak plug | S | Done — fill certainty beats a ~1¢ fee on a 10–40¢ edge |
+| ✅ | Afternoon CLI as authoritative floor (blended into `observed_max`) | settlement literacy | M | Done — day-one live check: NYC official floor ran 2°F above raw METARs |
 | P1 | Latency + markout instrumentation | measurement | S | Measure where the ~100 min goes before buying speed |
 | P1 | Event-driven afternoon cadence + obs high-water mark + METAR phase-lock | speed | M | The core edge is measured in minutes; we currently run ~last |
-| P1 | Parse afternoon CLI (verified ~4:40–5:45pm local) as authoritative floor | settlement literacy | M | Trade the instrument that pays, not a proxy of it |
+| P2 | Post-issuance new-high rates per city (archive fit) | settlement literacy | S | Prices the 4:40pm–close window the CLI floor opens up |
 | P2 | Validate + enable 12 more high-temp cities | capacity | M | ~4× venues, same code; the station map is the only risk and it's automated |
 | P2 | Daily-LOW support (`KXLOWT*`) | new instrument | M | Second deterministic window per city-day, in a less contested hour |
 | P2 | Event-strip sum arbitrage pass | model-free | M | Riskless when it fires; monetizes other bots' aggression |

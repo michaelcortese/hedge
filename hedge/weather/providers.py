@@ -18,6 +18,7 @@ forecasts use a short TTL; the historical-archive fetchers (``archive.py``) use
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -212,6 +213,125 @@ def iem_daily_max_f(
         except (TypeError, ValueError):
             continue
     return out
+
+
+IEM_AFOS_LIST_URL = "https://mesonet.agron.iastate.edu/api/1/nws/afos/list.json"
+IEM_NWSTEXT_URL = "https://mesonet.agron.iastate.edu/api/1/nwstext/"
+
+
+def _get_text(url: str, key: str, ttl: float | None, timeout: float = 45.0) -> str | None:
+    """Like ``_get_json`` but for text/plain responses (NWS text products)."""
+    cached = cache.load(key, ttl)
+    if cached is not None:
+        return cached
+    last_exc: Exception | None = None
+    for _attempt in range(3):
+        try:
+            resp = requests.get(url, headers=_UA, timeout=timeout)
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_exc = exc
+            continue
+        if not resp.ok:
+            return None
+        cache.store(key, resp.text)
+        return resp.text
+    if last_exc is not None:
+        raise last_exc
+    return None
+
+
+# Every CLI variant carries the climate day on one line, e.g.
+# "...THE CENTRAL PARK NY CLIMATE SUMMARY FOR JUNE 30 2026..." — the morning/afternoon
+# intraday issuances ("VALID [TODAY] AS OF 0400 PM LOCAL TIME.") and the
+# after-midnight final (YESTERDAY sections) alike.
+_CLI_DATE_RE = re.compile(r"CLIMATE SUMMARY FOR\s+([A-Z]+)\s+(\d{1,2})\s+(\d{4})")
+# In the TEMPERATURE section the first integer after MAXIMUM is the observed value;
+# the observation time and the record/normal columns follow it on the same line
+# ("MAXIMUM  87  1226 PM  99  1964 ..."). A missing value prints "MM" -> no match.
+_CLI_MAX_RE = re.compile(r"^\s*MAXIMUM\s+(-?\d+)\b")
+_CLI_MONTHS = {m: i for i, m in enumerate(
+    ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+     "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], start=1)}
+
+
+def _parse_cli_product(text: str) -> tuple[date, float] | None:
+    """Extract ``(climate_day, observed_max_f)`` from one CLI product text.
+
+    Returns None when either is absent (unparseable product, or the max printed
+    "MM"/missing) or the value is outside a sane °F range — a mis-parse here would
+    become a false settlement floor, so refuse rather than guess.
+    """
+    up = text.upper()
+    m = _CLI_DATE_RE.search(up)
+    if not m or m.group(1)[:3] not in _CLI_MONTHS:
+        return None
+    try:
+        day = date(int(m.group(3)), _CLI_MONTHS[m.group(1)[:3]], int(m.group(2)))
+    except ValueError:
+        return None
+    lines = up.splitlines()
+    temp_idx = next(
+        (i for i, ln in enumerate(lines) if ln.lstrip().startswith("TEMPERATURE")), None)
+    if temp_idx is None:
+        return None
+    for ln in lines[temp_idx:]:
+        mm = _CLI_MAX_RE.match(ln)
+        if mm:
+            value = float(mm.group(1))
+            return (day, value) if -60.0 <= value <= 135.0 else None
+    return None
+
+
+def iem_cli_max_so_far_f(
+    station: Station,
+    target_date: date,
+    *,
+    ttl: float | None = 600.0,
+) -> float | None:
+    """Official max-so-far (°F) for the station's climate day, from the NWS CLI.
+
+    The CLI (Climatological Report Daily) is the *settlement instrument*: Kalshi's
+    temperature markets resolve to the value this product prints. NWS issues it
+    intraday — verified 2026-07-01: a ~4:40–5:45pm local issuance for all four
+    cities printing the official high-so-far (AUS also got a morning one) — and a
+    final after local midnight with the settled value. Reading it removes the last
+    basis between a raw-obs floor and the paying number (tenths-°C conversion,
+    1-minute peaks the hourly METARs miss — the 06-29 class of mismatch).
+
+    Mechanics: list the AFOS issuances for the target UTC date *and* the next
+    (a late-evening western-city issuance files under the next UTC day), fetch each
+    product text (immutable by product_id → cached forever), parse, keep only
+    products whose printed climate day equals ``target_date``, and return the value
+    from the LATEST issuance — a correction supersedes the original, it does not
+    max() with it. Best-effort: returns None on any failure or when no product
+    matches yet (most mornings), and callers fall back to raw observations.
+    """
+    iem_id = getattr(station, "iem_id", "")
+    if not iem_id:
+        return None
+    pil = f"CLI{iem_id.upper()}"
+    best_entered, best_value = "", None
+    try:
+        rows: list[dict] = []
+        for d in (target_date, target_date + timedelta(days=1)):
+            key = f"afos-list:{pil}:{d.isoformat()}"
+            data = _get_json(
+                IEM_AFOS_LIST_URL, {"pil": pil, "date": d.isoformat()}, key, ttl)
+            rows.extend((data or {}).get("data", []) or [])
+        for row in rows:
+            pid = str(row.get("product_id") or "")
+            if not pid:
+                continue
+            text = _get_text(f"{IEM_NWSTEXT_URL}{pid}", key=f"nwstext:{pid}", ttl=None)
+            parsed = _parse_cli_product(text or "")
+            if parsed is None or parsed[0] != target_date:
+                continue
+            entered = str(row.get("entered") or pid)  # ISO ts; lexicographic == chrono
+            if entered > best_entered:
+                best_entered, best_value = entered, parsed[1]
+    except requests.RequestException:
+        return None  # IEM hiccup must never take the raw-obs floor down with it
+    return best_value
 
 
 def _climate_day_utc(tz_name: str, day: date) -> tuple[datetime, datetime]:

@@ -93,3 +93,91 @@ def test_missing_or_malformed_rows_skipped(monkeypatch):
         {"properties": {"timestamp": "2026-07-01T15:00:00+00:00"}},  # no temperature
     ])
     assert providers.nws_recent_temps_f(NYC, date(2026, 7, 1)) == []
+
+
+# --------------------------------------------------------------------------- #
+# CLI product (the settlement instrument) — parse + issuance selection         #
+# --------------------------------------------------------------------------- #
+def _cli_text(day_line: str = "JUNE 30 2026",
+              max_line: str = "  MAXIMUM         87   1226 PM  99    1964  84      3       90",
+              valid_line: str = "VALID TODAY AS OF 0400 PM LOCAL TIME.") -> str:
+    # Abbreviated from a real CLINYC intraday product (2026-06-30 20:40Z).
+    return f"""000
+CDUS41 KOKX 302040
+CLINYC
+
+CLIMATE REPORT
+NATIONAL WEATHER SERVICE NEW YORK, NY
+440 PM EDT TUE JUN 30 2026
+
+...THE CENTRAL PARK NY CLIMATE SUMMARY FOR {day_line}...
+{valid_line}
+
+WEATHER ITEM   OBSERVED TIME   RECORD YEAR NORMAL DEPARTURE LAST
+                VALUE   (LST)  VALUE       VALUE  FROM      YEAR
+...................................................................
+TEMPERATURE (F)
+ TODAY
+{max_line}
+  MINIMUM         73    522 AM  53    1919  69      4       71
+
+PRECIPITATION (IN)
+  TODAY            0.00          3.07 1984   0.13  -0.13      T
+"""
+
+
+def test_cli_parse_intraday_product():
+    assert providers._parse_cli_product(_cli_text()) == (date(2026, 6, 30), 87.0)
+
+
+def test_cli_parse_morning_variant_colon_time_negative_departure():
+    # AUS 12:26Z shape: "VALID AS OF" (no TODAY), colon in the obs time, negative
+    # departure later on the line — the first integer is still the observed value.
+    text = _cli_text(
+        max_line="  MAXIMUM         79  12:28 AM 100    1980  94    -15",
+        valid_line="VALID AS OF 0700 AM LOCAL TIME.",
+    )
+    assert providers._parse_cli_product(text) == (date(2026, 6, 30), 79.0)
+
+
+def test_cli_parse_missing_value_and_junk_rejected():
+    assert providers._parse_cli_product(_cli_text(max_line="  MAXIMUM         MM")) is None
+    assert providers._parse_cli_product(_cli_text(max_line="  MAXIMUM        200")) is None
+    assert providers._parse_cli_product("NOT A CLI PRODUCT AT ALL") is None
+
+
+def _patch_afos(monkeypatch, listing_by_date: dict, texts_by_pid: dict) -> None:
+    def fake_get_json(url, params, key, ttl, **kw):
+        return {"data": listing_by_date.get(params["date"], [])}
+
+    def fake_get_text(url, key, ttl, **kw):
+        return texts_by_pid.get(url.rsplit("/", 1)[-1])
+
+    monkeypatch.setattr(providers, "_get_json", fake_get_json)
+    monkeypatch.setattr(providers, "_get_text", fake_get_text)
+
+
+def test_cli_max_filters_by_date_and_latest_issuance_supersedes(monkeypatch):
+    # The 06:42Z product is the FINAL for the previous day (wrong climate day ->
+    # ignored); the 22:43Z correction supersedes the 20:40Z intraday even though
+    # its value is LOWER — the official record is replaced, not max()ed.
+    listing = {"2026-06-30": [
+        {"entered": "2026-06-30T06:42:00Z", "product_id": "P-final-prev"},
+        {"entered": "2026-06-30T20:40:00Z", "product_id": "P-intraday"},
+        {"entered": "2026-06-30T22:43:00Z", "product_id": "P-correction"},
+    ], "2026-07-01": []}
+    texts = {
+        "P-final-prev": _cli_text(day_line="JUNE 29 2026"),
+        "P-intraday": _cli_text(max_line="  MAXIMUM         88   1226 PM  99    1964"),
+        "P-correction": _cli_text(max_line="  MAXIMUM         87   1226 PM  99    1964"),
+    }
+    _patch_afos(monkeypatch, listing, texts)
+    assert providers.iem_cli_max_so_far_f(CHI, date(2026, 6, 30)) == 87.0
+
+
+def test_cli_max_none_when_no_matching_product_or_no_iem_id(monkeypatch):
+    _patch_afos(monkeypatch, {}, {})
+    assert providers.iem_cli_max_so_far_f(NYC, date(2026, 6, 30)) is None
+    from hedge.weather.stations import Station
+    bare = Station("KXTEST", "Testville", "KTST", 0.0, 0.0, "America/New_York")
+    assert providers.iem_cli_max_so_far_f(bare, date(2026, 6, 30)) is None
