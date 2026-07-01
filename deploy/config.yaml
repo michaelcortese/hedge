@@ -14,9 +14,10 @@ kalshi:
 
 risk:
   lambda_kelly: 0.10        # conservative fractional Kelly
-  k_sigma: 2.0
+  k_sigma: 2.5              # Dial 1: only act on higher-conviction disagreements
+                           # (gap must beat 2.5x sigma, up from 2.0) -> bigger, less often
   z_ci: 1.0
-  tau_min_cents: 2
+  tau_min_cents: 3          # Dial 1: ignore edges under 3c (was 2c)
   market_cap_frac: 0.03
   portfolio_cap: 0.30
   event_cap_frac: 0.06      # cap total risk across all buckets of one city-day. They
