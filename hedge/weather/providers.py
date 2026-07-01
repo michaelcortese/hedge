@@ -19,7 +19,8 @@ forecasts use a short TTL; the historical-archive fetchers (``archive.py``) use
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -213,6 +214,25 @@ def iem_daily_max_f(
     return out
 
 
+def _climate_day_utc(tz_name: str, day: date) -> tuple[datetime, datetime]:
+    """UTC bounds ``[start, end)`` of the NWS climatological day for a local date.
+
+    The climate day the CLI report (and hence Kalshi settlement) summarizes runs
+    midnight-to-midnight LOCAL STANDARD TIME year-round — during DST the boundary
+    sits at 1am on the local clock, not midnight. Standard offset = utcoffset - dst,
+    probed at local noon so the probe itself can't straddle a transition.
+    """
+    tz = ZoneInfo(tz_name)
+    noon = datetime(day.year, day.month, day.day, 12, tzinfo=tz)
+    std_offset = (noon.utcoffset() or timedelta(0)) - (noon.dst() or timedelta(0))
+    start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc) - std_offset
+    return start, start + timedelta(hours=24)
+
+
+#: NWS QC codes marking a temperature as rejected ("X") or questioned ("Q").
+_BAD_QC = {"X", "Q"}
+
+
 def nws_recent_temps_f(
     station: Station,
     target_date: date,
@@ -221,22 +241,41 @@ def nws_recent_temps_f(
 ) -> list[float]:
     """Observed temperatures (°F) reported so far on ``target_date`` at the station.
 
-    Used by the nowcast strategy to compute the observed max-so-far (a hard floor
-    on the day's final high). Pulls recent observations and keeps those whose
-    timestamp falls on the target local day.
+    Used by the nowcast strategy to compute the observed max-so-far — a hard floor
+    on the day's final high that the deterministic "bucket impossible" trade bets
+    on at near-full size. A single wrong-day or junk reading therefore becomes a
+    confident guaranteed loss, so two filters guard the floor:
+
+      * Only observations whose timestamp falls inside the station's NWS
+        climatological day (midnight-to-midnight local STANDARD time — 1am on the
+        local clock during DST) are kept. A raw 00:00-UTC window would include
+        ~4-8pm of the *previous* local evening for all US stations; after an
+        overnight cold front, yesterday evening is warmer than today's whole day
+        and would print a false floor.
+      * Observations whose temperature failed NWS quality control (rejected /
+        questioned) are dropped — one glitched sensor spike is a false floor too.
     """
+    start_utc, end_utc = _climate_day_utc(station.tz, target_date)
     key = f"nws-obs:{station.nws_station}:{target_date}"
     data = _get_json(
         f"https://api.weather.gov/stations/{station.nws_station}/observations",
-        {"start": f"{target_date.isoformat()}T00:00:00+00:00"}, key, ttl,
+        {"start": start_utc.isoformat(timespec="seconds")}, key, ttl,
     )
     if not data:
         return []
     temps: list[float] = []
     for feat in data.get("features", []):
         props = feat.get("properties", {})
-        c = (props.get("temperature") or {}).get("value")
-        if c is None:
+        try:
+            ts = datetime.fromisoformat(
+                str(props.get("timestamp", "")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if ts.tzinfo is None or not (start_utc <= ts < end_utc):
+            continue
+        temp = props.get("temperature") or {}
+        c = temp.get("value")
+        if c is None or str(temp.get("qualityControl", "")).upper() in _BAD_QC:
             continue
         temps.append(c * 9 / 5 + 32)  # API returns Celsius
     return temps

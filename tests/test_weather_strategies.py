@@ -56,6 +56,26 @@ def test_nowcast_abstains_before_min_hour():
     assert strat.evaluate(_bucket(84, 86)) is None
 
 
+def test_nowcast_deterministic_fires_before_min_hour():
+    # Frontal-passage morning: the high is already locked at 88F by 9am. A bucket
+    # entirely below it is logically dead ALL DAY — the deterministic signal must
+    # not wait for the afternoon probabilistic window while the book still bids it.
+    morning = datetime(2025, 6, 28, 9, tzinfo=NY_TZ)
+    strat = WeatherNowcastStrategy(source=FakeSource([85], obs=88.0),
+                                   now=morning, min_hour=14)
+    sig = strat.evaluate(_bucket(73, 74))
+    assert sig is not None and sig.deterministic
+    assert sig.prob < 0.01
+
+
+def test_nowcast_probabilistic_still_gated_before_min_hour():
+    # Same morning, but a bucket the observations do NOT settle -> still abstain.
+    morning = datetime(2025, 6, 28, 9, tzinfo=NY_TZ)
+    strat = WeatherNowcastStrategy(source=FakeSource([85], obs=70.0),
+                                   now=morning, min_hour=14)
+    assert strat.evaluate(_bucket(84, 86)) is None
+
+
 def test_nowcast_abstains_without_observations():
     afternoon = datetime(2025, 6, 28, 15, tzinfo=NY_TZ)
     strat = WeatherNowcastStrategy(source=FakeSource([85], obs=None), now=afternoon)

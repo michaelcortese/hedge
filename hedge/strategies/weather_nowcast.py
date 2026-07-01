@@ -13,9 +13,12 @@ Mechanics:
   * As the day matures ``obs_max`` rises toward the true high and the forecast's own
     spread shrinks, so the distribution sharpens dramatically vs the morning view.
 
-It **abstains until mid-afternoon** (``min_hour``, ~2pm local), when observations
-carry little information about the eventual peak and the floor is far below the high —
-this is where the durable obs-lag edge lives, so morning cycles add only fee bleed.
+The *probabilistic* path **abstains until mid-afternoon** (``min_hour``, ~2pm local),
+when observations carry little information about the eventual peak and the floor is far
+below the high — this is where the durable obs-lag edge lives, so morning cycles add
+only fee bleed. The *deterministic* path (a bucket the observed max has already logically
+settled) runs ALL DAY: the floor is valid from the first observation, and on
+frontal-passage days the high locks in before noon.
 """
 
 from __future__ import annotations
@@ -94,13 +97,11 @@ class WeatherNowcastStrategy(Strategy):
 
         station_tz = ZoneInfo(tm.station.tz)
         now = (self.now or datetime.now(station_tz)).astimezone(station_tz)
-        # Only act on the *current* day, after the morning, when obs are informative.
-        if now.date() != tm.local_date or now.hour < self.min_hour:
+        # Only act on the *current* local day.
+        if now.date() != tm.local_date:
             return None
 
         obs_max = self.source.observed_max(tm.station, tm.local_date)
-        if obs_max is None:
-            return None  # no observations yet -> nothing to nowcast from
 
         # Deterministic "impossible/certain bucket": the day's max can only rise, and
         # settlement rounds the high to a whole °F (NWS: floor(x+0.5)). So once the
@@ -109,9 +110,25 @@ class WeatherNowcastStrategy(Strategy):
         # already certain. This is the cleanest who's-on-the-other-side trade — a slow
         # book still bidding a settled-impossible bucket. Gated to validated stations:
         # a wrong station map would make "impossible" a confident-wrong NO.
-        det = self._deterministic_signal(tm, obs_max, now)
-        if det is not None:
-            return det
+        #
+        # Checked ALL DAY, before the min_hour gate: the floor logic is valid from the
+        # first observation of the climate day, and on frontal-passage days (temps
+        # falling since morning) the high locks in hours before the afternoon window —
+        # buckets below it are dead all day while the book still bids them. min_hour
+        # exists to keep the *probabilistic* path out of the uninformative morning; it
+        # was never a correctness condition for the deterministic one. (Safe only
+        # because nws_recent_temps_f filters obs to the local climate day — yesterday
+        # evening's temps polluting obs_max was exactly the false-floor bug.)
+        if obs_max is not None:
+            det = self._deterministic_signal(tm, obs_max, now)
+            if det is not None:
+                return det
+
+        # The probabilistic path needs observations and stays gated to the afternoon:
+        # morning obs carry little information about the eventual peak, so morning
+        # cycles would add only fee bleed.
+        if obs_max is None or now.hour < self.min_hour:
+            return None
 
         highs = self.source.point_highs(tm.station, tm.local_date)
         # Forecast center must respect the floor: the final high is at least obs_max.
