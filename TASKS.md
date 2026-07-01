@@ -59,3 +59,82 @@ or trusting the ramp on real money.
 
 See the full tournament output for honorable mentions (maker-only convergence, joint
 categorical Kelly, adverse-selection guard, decorrelated vendors, °C→°F lattice).
+
+---
+
+# Quant review (2026-06-30) — action items
+
+Four-reviewer review (alpha/edge · risk-engine audit · proposed-changes ·
+adversarial red-team) of the strategy + a proposed "more active intraday / salvage
+losers" change, with direct code verification. **Headline: no edge has been measured
+against the market price; the only plausible edge (deterministic obs-lag NO) is tiny,
+capacity-limited, and unproven. Do NOT make the bot more active until P1+P2 clear.**
+Engine arithmetic is clean (no sign/fee/idempotency bugs) — the issues are
+calibration, inputs, and proof, not the math.
+
+## P1 — correctness & honest σ (do first)
+- [~] **Nowcast `settlement_sigma` — WON'T DO (intentional, not a bug).** On reading the
+      code, `weather_ensemble.py:65-70` documents that the nowcast *deliberately* omits the
+      grid→station basis term: its obs floor is already read off the settlement station, so
+      adding `settlement_sigma_f` would be a **double penalty**. The reviewer flagged this
+      without seeing the rationale. Leaving as-is. (Open question for later: the forecast
+      *upside* above the floor is still grid-based, so a small partial-basis term might be
+      defensible — but that's a judgement call, not the naive fix.)
+- [x] **`nws_recent_temps_f` local-day filter — DONE.** `providers.py` now parses each obs
+      `timestamp`, converts to the station tz, and drops readings whose local date != target
+      (and drops timestamp-less readings). Tests in `tests/test_providers_obs_filter.py`.
+      (Low live risk given `min_hour=14`, but fixes a real latent bug + backtest/replay.)
+- [ ] **Validate IEM/station == Kalshi settlement, then flip `HEDGE_CALIBRATE_AGAINST=station`**
+      (OPS — not in this PR). Prod runs `truth=era5` *by design* (station-truth gated until
+      validated). Closing it is the biggest risk reduction but requires running
+      `scripts/validate_stations.py` against resolved settlements, then setting a Fly secret —
+      neither doable from the code branch. Tracked for an operator.
+- [x] **Move skill-gate / kill-switch evidence onto `/data` — DONE.** `runner.py` `LIVE_DIR`
+      now honors `HEDGE_STATE_DIR`, so the decision logs (which the guard + skill gate read),
+      the `hedge.db` state, and the HALTED latch all land on the durable `/data` volume in
+      prod and survive redeploys. Verified the guard reads `LIVE_DIR.glob("decisions_*.jsonl")`
+      (not the state DB), so moving the dir is the correct fix. Local/tests unchanged.
+
+## P2 — prove the edge before any size increase
+- [ ] **Run `score_skill_vs_market` on ≥30 settled acted-on nowcast signals**, segmented
+      deterministic vs probabilistic. Today it has **zero data** — edge-vs-price is literally
+      unmeasured. Expectation to falsify: probabilistic skill ≈ 0 (model == mid); all skill is
+      in deterministic rows → then the real question is transactable **depth** after the ~1¢ fee.
+- [ ] **Stay paper-only / deterministic-NO-only until P1+P2 clear.** Collect the calibration
+      set at $0 risk via `run_paper.py` rather than paying the correlated tail to gather it.
+
+## P3 — the one defensible behavior change (low value; AFTER P1)
+- [x] **Edge-checked exit leg — IMPLEMENTED (gated, off by default; needs paper validation
+      before arming).** `engine._exit_check` runs **ahead of** the open-only gates and, only
+      when the new `RiskConfig.exit_leg` flag is armed (**default off**, a dedicated switch so
+      a deploy is a no-op until validated — deploy already has `manage_positions: true`) and we
+      hold the market, sells the **held** side at its own bid when
+      `held_bid − taker_fee − fair_value ≥ tau_exit` (new `RiskConfig.tau_exit_cents`, default
+      2¢). Full-lot, not λ-scaled; no-bid ⇒ no-op. Tests in `test_decision_engine.py`
+      cover: exit fires where a flip-to-close is band-blocked, no exit on a +EV hold, no-op on
+      a dead (no-bid) bucket, and disabled when management is off.
+      **Still TODO before arming live:** validate in paper (`manage_positions` on, paper path)
+      that exit-rule P&L beats hold-to-settlement net of fees; count regretted exits / fee drag.
+      Did **not** yet rewrite the misleading "exits are band-exempt" comments (`engine.py:299`,
+      `deploy/config.yaml:41`, `signal.py:44-48`) — the new leg makes exits genuinely possible,
+      but those comments describe `_reconcile`, which is still gated; revisit when wiring the
+      paper validation.
+
+## WONT — rejected by the review (recorded so we don't revisit)
+- **Stop-loss on win-prob/MTM threshold** — −EV "+EV-sale trap": dumping a NO the model rates
+  26% at a 5¢ bid realizes a loss the model says not to take. The only defensible stop is
+  "model-EV at the bid < 0", which is just the P3 exit leg.
+- **Correlation-aware trim (standalone)** — backwards: holding NO across mutually-exclusive
+  buckets means at most ONE loses and the rest WIN; trimming sells winners. The correlated
+  case (YES across adjacent buckets) is already capped at open by `event_cap_frac=0.06`.
+- **Open more / raise `portfolio_cap` / lower skill floor** — most dangerous; pours size into
+  an unproven, mis-calibrated model right where it lost ~40% on Jun-29. "0 trades, over the
+  cap" is the safety machinery working as designed, not a defect.
+
+## Watch (not yet actionable)
+- **Daily-loss stop is porous to correlated settlement:** the `$15` stop only gates *future*
+  orders on *already-realized* P&L, but a city-day's buckets settle together in one cycle and
+  blow through it. Real bound is `event_cap_frac × 4 cities ≈ 24%` of bankroll in one evening.
+  Consider a pre-trade correlated-exposure cap if going live at size.
+- All four settlement stations are `validated=True` (`stations.py:64-67`) — station-map risk is
+  low; the live basis risk is the calibration default (P1), not the map.

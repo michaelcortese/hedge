@@ -49,7 +49,13 @@ from hedge.weather.markets import discover_temp_markets
 from hedge.weather.sources import LiveForecastSource
 from hedge.weather.stations import STATIONS, station_for_ticker
 
-LIVE_DIR = Path("data/runs/live")
+# State DB, decision logs, and the HALTED latch all live here. In prod HEDGE_STATE_DIR
+# points at the durable Fly volume (/data), so the guard / skill-gate evidence (read
+# from decisions_*.jsonl) and the kill-switch latch SURVIVE a redeploy that wipes the
+# ephemeral container layer — without this the skill multiplier never accumulates its
+# 30 settled samples and the Brier kill-switch never reaches its window. Unset (local /
+# tests) it falls back to the in-repo path; mirrors State/EventLog's own default.
+LIVE_DIR = Path(os.environ.get("HEDGE_STATE_DIR", "data/runs/live"))
 
 
 def _event_key(ticker: str) -> str:
@@ -121,11 +127,13 @@ class Runner:
         # Missing strategy -> 1.0 (full base λ). Composes with the skill multiplier.
         self.strategy_lambda = strategy_lambda or {}
         self._skill_mult = 1.0   # refreshed each cycle when the skill gate is enabled
-        # Durable state lives next to the decision logs (the Fly volume in prod).
+        # Durable state lives next to the decision logs (the Fly volume in prod, now
+        # that LIVE_DIR honors HEDGE_STATE_DIR).
         self.state = state if state is not None else State(LIVE_DIR / "hedge.db")
-        # Append-only audit trail on the DURABLE volume (HEDGE_STATE_DIR=/data in prod),
-        # separate from hedge.db so the historical record survives a redeploy that wipes
-        # the working DB. Every state mutation below also emits one event line here. The
+        # Append-only audit trail on the DURABLE volume (HEDGE_STATE_DIR=/data in prod):
+        # the immutable historical record, distinct from hedge.db (the mutable working
+        # state). Both now live on the durable volume. Every state mutation below also
+        # emits one event line here. The
         # default base mirrors _write_status (HEDGE_STATE_DIR, else LIVE_DIR) so it lands
         # on the durable volume in prod and tracks a monkeypatched LIVE_DIR in tests.
         self.eventlog = eventlog if eventlog is not None else EventLog(
@@ -265,8 +273,9 @@ class Runner:
         LIVE_DIR.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(ZoneInfo("UTC")).isoformat()
         self._halt_file().write_text(f"{stamp} {reason}\n")
-        # Durable record of the halt — the HALTED latch file lives on the ephemeral
-        # layer and is cleared by --reset-guard, so the event log is the lasting trail.
+        # The HALTED latch now lives on the durable volume (LIVE_DIR honors
+        # HEDGE_STATE_DIR), so a tripped kill-switch correctly STAYS tripped across a
+        # redeploy and is cleared only by --reset-guard; the event log mirrors it too.
         self.eventlog.emit("halt", {"reason": reason}, seq=getattr(self, "_cycle_seq", None))
 
     def _trip(self, status: GuardStatus) -> None:

@@ -19,7 +19,8 @@ forecasts use a short TTL; the historical-archive fetchers (``archive.py``) use
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -232,9 +233,24 @@ def nws_recent_temps_f(
     )
     if not data:
         return []
+    # The query starts at UTC midnight, which is the *previous* local evening for US
+    # time zones, and the API returns whatever falls after it — so filter each reading
+    # back to the target LOCAL day before taking the max. Without this, last evening's
+    # temps pool into today's obs_max, inflating the floor and producing a confident-
+    # but-wrong "impossible bucket" deterministic NO (the one trade that carries size).
+    tz = ZoneInfo(station.tz)
     temps: list[float] = []
     for feat in data.get("features", []):
         props = feat.get("properties", {})
+        ts = props.get("timestamp")
+        if not ts:
+            continue  # no timestamp -> can't confirm the local day; drop it
+        try:
+            obs_local_date = datetime.fromisoformat(ts).astimezone(tz).date()
+        except ValueError:
+            continue
+        if obs_local_date != target_date:
+            continue  # belongs to a different local day (e.g. prior evening)
         c = (props.get("temperature") or {}).get("value")
         if c is None:
             continue

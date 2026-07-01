@@ -16,7 +16,13 @@ class RiskConfig:
     lambda_kelly: float = 0.25      # fraction of full Kelly to bet (0.25-0.5)
     k_sigma: float = 2.0            # require |p - mid| > k_sigma * sigma to act
     z_ci: float = 1.0              # conservative-edge CI haircut: use p ∓ z*sigma
-    tau_min_cents: float = 2.0      # minimum net edge (cents) to trade
+    tau_min_cents: float = 2.0      # minimum net edge (cents) to OPEN a position
+    # Minimum net advantage (cents) for the risk-reducing EXIT leg to fire: only close
+    # a held position when the market's bid for it beats the model's fair value (net the
+    # taker fee) by at least this. Separate from tau_min so exits and opens tune apart;
+    # it is the anti-churn margin that stops noise-driven flip-flopping. See
+    # engine._exit_check. Only active when manage_positions is True.
+    tau_exit_cents: float = 2.0
     market_cap_frac: float = 0.03   # max bankroll fraction at risk per market (one bucket)
     portfolio_cap: float = 0.30     # max total bankroll fraction at risk
     rebalance_band: float = 0.25    # only rebalance if target drifts > this frac
@@ -52,6 +58,14 @@ class RiskConfig:
     # is proven on realized, market-priced, fee-net P&L. When False the runner only
     # OPENS new positions (and reads holdings for the portfolio cap); never trims/flips.
     manage_positions: bool = False
+
+    # Risk-reducing EXIT leg (engine._exit_check): close a held position when the book's
+    # bid for it exceeds the model's fair value (net the taker fee) by tau_exit — the
+    # SELL-side mirror of the obs-lag edge. OFF by default and a SEPARATE switch from
+    # manage_positions on purpose: it changes real-money behavior, so it must stay dark
+    # until validated in paper (exit-rule P&L vs hold-to-settlement, fee-net). It still
+    # needs manage_positions on for the runner to hand the engine a Position to act on.
+    exit_leg: bool = False
 
     # Anti-churn: after a management trade (trim/add/flip-to-exit) on a ticker, do not
     # act on that ticker again for this many cycles. Prevents a noisy signal from
@@ -89,6 +103,11 @@ class RiskConfig:
     def tau_min(self) -> float:
         """Minimum net edge in dollars."""
         return self.tau_min_cents / 100.0
+
+    @property
+    def tau_exit(self) -> float:
+        """Minimum net exit advantage in dollars (see tau_exit_cents)."""
+        return self.tau_exit_cents / 100.0
 
     @classmethod
     def from_dict(cls, d: dict) -> RiskConfig:
