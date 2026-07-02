@@ -199,3 +199,26 @@ def test_price_band_lowering_floor_lets_cheap_open_through():
     cfg = RiskConfig(lambda_kelly=0.25, k_sigma=2.0, tau_min_cents=2.0, min_price=0.01)
     d = decide(_sig(0.30, se=0.01), q, BANKROLL, cfg)
     assert d.action is Action.BUY and d.side is Side.YES and d.count > 0
+
+
+def test_deterministic_signal_crosses_instead_of_resting():
+    # A logically-settled bucket: the stale YES bids ARE the fill, and they get
+    # pulled as the news spreads — the engine must take them (IOC), not rest a
+    # maker to shave the fee and risk missing a near-riskless 20c+ edge.
+    sig = Signal(ticker="MKT", prob=1e-4, std_error=1e-6, deterministic=True)
+    q = MarketQuote(yes_bid=0.30, yes_ask=0.35)
+    d = decide(sig, q, BANKROLL, RISK)
+    assert d.action is Action.BUY and d.side is Side.NO
+    assert d.maker is False
+    assert d.price == q.no_ask  # crossed to 1 - yes_bid
+
+
+def test_probabilistic_signal_same_prices_still_prefers_maker():
+    # Identical prices/probability but NOT deterministic -> the normal maker
+    # preference stands (cheaper fill, lower fee).
+    sig = Signal(ticker="MKT", prob=1e-4, std_error=1e-6)
+    q = MarketQuote(yes_bid=0.30, yes_ask=0.35)
+    d = decide(sig, q, BANKROLL, RISK)
+    assert d.action is Action.BUY and d.side is Side.NO
+    assert d.maker is True
+    assert d.price == q.no_bid  # resting at 1 - yes_ask

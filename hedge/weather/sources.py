@@ -30,8 +30,22 @@ class ForecastSource(Protocol):
         ...
 
 
+#: Distrust a CLI floor that exceeds every raw observation by more than this. The CLI
+#: is derived from the SAME sensor, so a large positive gap means a parse or station
+#: mix-up — and an inflated floor is exactly the false-floor failure mode everything
+#: else guards against. (A small positive gap is legitimate and is the point: the
+#: 1-minute peak between hourly METARs, plus official rounding.)
+_CLI_OBS_MAX_GAP_F = 5.0
+
+
 class LiveForecastSource:
-    """Production source: Open-Meteo multi-model + NWS gridpoint, plus live obs."""
+    """Production source: Open-Meteo multi-model + NWS gridpoint, plus live obs.
+
+    ``observed_max`` blends two floors: raw station observations (api.weather.gov)
+    and, when an issuance exists for the day, the official high-so-far printed by
+    the NWS CLI product — the actual settlement instrument, so it is the
+    highest-trust floor and typically 0.5–2°F sharper than max(hourly METARs).
+    """
 
     def __init__(self, models: list[str] | None = None):
         self.models = models or DEFAULT_MODELS
@@ -48,7 +62,12 @@ class LiveForecastSource:
 
     def observed_max(self, station: Station, target_date: date) -> float | None:
         temps = providers.nws_recent_temps_f(station, target_date)
-        return max(temps) if temps else None
+        obs = max(temps) if temps else None
+        cli = providers.iem_cli_max_so_far_f(station, target_date)
+        if cli is not None and obs is not None and cli > obs + _CLI_OBS_MAX_GAP_F:
+            return obs  # CLI implausibly far above every raw ob -> distrust the parse
+        candidates = [v for v in (obs, cli) if v is not None]
+        return max(candidates) if candidates else None
 
 
 class ArchiveForecastSource:

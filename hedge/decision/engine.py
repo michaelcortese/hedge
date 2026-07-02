@@ -281,7 +281,15 @@ def decide(
                   if _tradeable(maker_price) else float("-inf"))
     taker_edge = (_net_edge_at(win_prob, taker_price, maker=False, cfg=cfg)
                   if _tradeable(taker_price) else float("-inf"))
-    if maker_edge >= cfg.tau_min:
+    # A DETERMINISTIC signal crosses the spread instead of resting: its taker
+    # liquidity (the stale side still quoting a logically-settled bucket) evaporates
+    # as the news spreads, while a resting maker on a dead bucket only ever fills
+    # against someone aggressively buying a settled-impossible outcome. Trading a
+    # ~1-2c fee-plus-spread saving against fill risk on a 10-40c near-riskless edge
+    # is a bad swap — capture the edge now.
+    if signal.deterministic and taker_edge >= cfg.tau_min:
+        maker, exec_price, gross_edge = False, taker_price, taker_edge
+    elif maker_edge >= cfg.tau_min:
         maker, exec_price, gross_edge = True, maker_price, maker_edge
     elif taker_edge >= cfg.tau_min:
         maker, exec_price, gross_edge = False, taker_price, taker_edge
