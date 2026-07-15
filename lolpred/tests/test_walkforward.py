@@ -50,11 +50,33 @@ class SpyModel:
     def __init__(self, log: list):
         self._log = log
 
-    def fit(self, X, y, X_val=None, y_val=None):
+    def fit(self, X, y, X_val=None, y_val=None, X_cal=None, y_cal=None):
         seen = list(X.index)
         if X_val is not None:
             seen += list(X_val.index)
+        if X_cal is not None:
+            seen += list(X_cal.index)
         self._log.append(seen)
+        return self
+
+    def predict_proba(self, X):
+        return np.full(len(X), 0.5)
+
+
+class SliceSpy:
+    """Fake model recording the fit/val/cal slices separately."""
+
+    def __init__(self, log: list):
+        self._log = log
+
+    def fit(self, X, y, X_val=None, y_val=None, X_cal=None, y_cal=None):
+        self._log.append(
+            {
+                "fit": list(X.index),
+                "val": None if X_val is None else list(X_val.index),
+                "cal": None if X_cal is None else list(X_cal.index),
+            }
+        )
         return self
 
     def predict_proba(self, X):
@@ -246,6 +268,62 @@ class TestTemporalIntegrity:
         assert len(hold_dates) > 0
         assert (hold_dates >= pd.Timestamp("2021-06-01")).all()
         assert (reg_dates < pd.Timestamp("2021-06-01")).all()
+
+
+class TestValCalSplit:
+    """The train-tail carving: val/cal halves for big tails, val-only small."""
+
+    @staticmethod
+    def _run(n: int, calib_frac: float = 0.15):
+        feats = make_feature_frame(n=n, seed=2)
+        folds = make_folds(feats["date"], burn_in_end="2019-12-31")
+        assert folds
+        model_log: list[dict] = []
+        base_log: list[list] = []
+        run_walkforward(
+            feats,
+            folds,
+            model_factory=lambda: SliceSpy(model_log),
+            baseline_factory=lambda: SpyModel(base_log),
+            calib_frac=calib_frac,
+            verbose=False,
+        )
+        assert model_log
+        return model_log, base_log
+
+    def test_big_tail_split_val_then_cal(self):
+        # n=6000 -> every fold's tail >= 200 -> chronological val/cal halves.
+        model_log, _ = self._run(n=6000)
+        for call in model_log:
+            fit, val, cal = call["fit"], call["val"], call["cal"]
+            assert val is not None and cal is not None
+            tail = len(val) + len(cal)
+            assert tail >= 200
+            # halves differ by at most one row; cal gets the odd row
+            assert len(cal) - len(val) in (0, 1)
+            # chronological: fit < val < cal (index is date-sorted RangeIndex)
+            assert max(fit) < min(val)
+            assert max(val) < min(cal)
+
+    def test_small_tail_keeps_single_slice(self):
+        # n=1200 -> every fold's tail < 200 -> whole tail is val, no cal.
+        model_log, _ = self._run(n=1200)
+        for call in model_log:
+            assert call["cal"] is None
+            assert call["val"] is not None
+            assert 2 <= len(call["val"]) < 200
+            assert max(call["fit"]) < min(call["val"])
+
+    def test_baseline_fit_on_full_train_slice(self):
+        # The baseline (no early stopping/calibration) must see fit+val+cal.
+        for n in (1200, 6000):
+            model_log, base_log = self._run(n=n)
+            assert len(base_log) == len(model_log)
+            for m, b in zip(model_log, base_log, strict=True):
+                expected = set(m["fit"])
+                expected |= set(m["val"] or [])
+                expected |= set(m["cal"] or [])
+                assert set(b) == expected
 
 
 class TestFoldSpec:

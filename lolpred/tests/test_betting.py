@@ -62,6 +62,17 @@ class TestDevigShin:
         assert fair_a == pytest.approx(0.7, abs=1e-9)
         assert fair_b == pytest.approx(0.3, abs=1e-9)
 
+    def test_pinned_numeric_value(self):
+        # Independently verified with scipy.optimize.brentq on the Shin
+        # system: find z such that sum_i p_i(z) = 1 with
+        # p_i = (sqrt(z^2 + 4(1-z) pi_i^2 / B) - z) / (2(1-z)), B = booksum.
+        # For (0.60, 0.45): z = 0.0500548..., fair = (0.5750, 0.4250) exactly
+        # to 4 decimals.
+        fair_a, fair_b = devig_shin(0.60, 0.45)
+        assert fair_a == pytest.approx(0.5750, abs=5e-5)
+        assert fair_b == pytest.approx(0.4250, abs=5e-5)
+        assert fair_a + fair_b == pytest.approx(1.0)
+
     def test_close_to_proportional_at_small_vig(self):
         # 5% vig on a 0.6/0.4 fair line: Shin and proportional nearly agree.
         imp_a, imp_b = 0.6 * 1.05, 0.4 * 1.05
@@ -284,6 +295,28 @@ class TestSettleBets:
         bets = _hand_bets()
         settle_bets(bets, _BLUE_WIN)
         assert "won" not in bets.columns  # input not mutated
+
+    def test_non_integer_index_with_array_raises_typeerror(self):
+        # Ambiguous alignment: string-labeled bets + plain ndarray outcomes.
+        # Must raise a clear TypeError, not fail inside numpy.
+        bets = _hand_bets()
+        bets.index = ["g_a", "g_b", "g_c"]
+        with pytest.raises(TypeError, match="non-integer bets index"):
+            settle_bets(bets, _BLUE_WIN)
+
+    def test_non_integer_index_with_series_is_fine(self):
+        # Label alignment via a Series stays supported with any index type.
+        bets = _hand_bets()
+        bets.index = ["g_a", "g_b", "g_c"]
+        ser = pd.Series([1, 1, 0, 0, 1], index=["g_a", "g_b", "g_x", "g_y", "g_c"])
+        settled = settle_bets(bets, ser)
+        np.testing.assert_allclose(settled["pnl"], [0.1, -0.2, 0.25])
+
+    def test_empty_bets_non_integer_index_ok(self):
+        bets = _hand_bets().iloc[:0]
+        bets.index = pd.Index([], dtype=object)
+        settled = settle_bets(bets, _BLUE_WIN)
+        assert len(settled) == 0
 
 
 class TestSimulateBankroll:

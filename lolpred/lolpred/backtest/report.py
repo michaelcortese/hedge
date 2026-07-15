@@ -29,6 +29,13 @@ _EPS = 1e-15
 
 _SYNTHETIC_TAG = "[SYNTHETIC ODDS — plumbing validation only, not evidence of real edge]"
 
+#: Interpretation caveat attached to every momentum_test result.
+_MOMENTUM_CAVEAT = (
+    "lag_coef measures residual predictability = momentum OR model "
+    "misspecification; conditioning on logit(model_p) de-confounds only if "
+    "model_p is the true probability"
+)
+
 
 def _logit(p: np.ndarray, eps: float = 1e-9) -> np.ndarray:
     p = np.clip(np.asarray(p, dtype=float), eps, 1.0 - eps)
@@ -125,15 +132,23 @@ def momentum_test(
     negates the logit, and maps ``won_prev -> 1 - won_prev``, which only
     moves the intercept).
 
-    Significance proxy: ``n_resamples`` bootstrap row-resamples (with
-    replacement, ``np.random.default_rng(seed)``) refit the regression;
-    ``sign_stability`` is the fraction of successful resamples whose lag
-    coefficient has the same sign as the full-sample fit.  ~0.5 means noise;
-    near 1.0 means a stable directional effect.  Degenerate resamples
-    (single-class response) are skipped.
+    Significance proxy: ``n_resamples`` CLUSTER bootstrap resamples
+    (``np.random.default_rng(seed)``) refit the regression.  Whole SERIES
+    are resampled with replacement — never individual rows — because games
+    within a series are dependent (shared teams, shared day, the lag
+    structure itself), and a row bootstrap would understate the sampling
+    variability.  ``sign_stability`` is the fraction of successful resamples
+    whose lag coefficient has the same sign as the full-sample fit.  ~0.5
+    means noise; near 1.0 means a stable directional effect.  Degenerate
+    resamples (single-class response) are skipped.
 
-    Returns ``{"lag_coef", "sign_stability", "n"}`` where ``n`` is the
-    number of lag rows (games with a previous game in their series).
+    Interpretation caveat (also returned in the ``"caveat"`` field):
+    lag_coef measures residual predictability = momentum OR model
+    misspecification; conditioning on logit(model_p) de-confounds only if
+    model_p is the true probability.
+
+    Returns ``{"lag_coef", "sign_stability", "n", "caveat"}`` where ``n`` is
+    the number of lag rows (games with a previous game in their series).
     """
     required = {"series_id", "game_in_series", "blue_team", "red_team", "blue_win", "model_p"}
     missing = required - set(preds.columns)
@@ -151,7 +166,12 @@ def momentum_test(
 
     n = int(len(y))
     if n < 10 or len(np.unique(y)) < 2:
-        return {"lag_coef": float("nan"), "sign_stability": float("nan"), "n": n}
+        return {
+            "lag_coef": float("nan"),
+            "sign_stability": float("nan"),
+            "n": n,
+            "caveat": _MOMENTUM_CAVEAT,
+        }
 
     X = np.column_stack([x_skill, won_prev])
 
@@ -165,11 +185,21 @@ def momentum_test(
     lag_coef = _fit_lag_coef(X, y)
     full_sign = np.sign(lag_coef)
 
+    # Cluster bootstrap: resample SERIES, not rows (rows within a series are
+    # dependent).  Group lag-row positions by series id once, then draw
+    # n_series series with replacement per resample.
+    sids = df["series_id"].to_numpy()[has_prev]
+    _, inv = np.unique(sids, return_inverse=True)
+    order = np.argsort(inv, kind="stable")
+    groups = np.split(order, np.cumsum(np.bincount(inv))[:-1])
+    n_series = len(groups)
+
     rng = np.random.default_rng(seed)
     same_sign = 0
     fitted = 0
     for _ in range(n_resamples):
-        idx = rng.integers(0, n, size=n)
+        sel = rng.integers(0, n_series, size=n_series)
+        idx = np.concatenate([groups[s] for s in sel])
         yb = y[idx]
         if len(np.unique(yb)) < 2:
             continue
@@ -177,7 +207,57 @@ def momentum_test(
         if np.sign(_fit_lag_coef(X[idx], yb)) == full_sign:
             same_sign += 1
     stability = same_sign / fitted if fitted else float("nan")
-    return {"lag_coef": lag_coef, "sign_stability": float(stability), "n": n}
+    return {
+        "lag_coef": lag_coef,
+        "sign_stability": float(stability),
+        "n": n,
+        "caveat": _MOMENTUM_CAVEAT,
+    }
+
+
+def _per_game_logloss(y: np.ndarray, p) -> np.ndarray:
+    """Per-game log-loss contributions (clipped like probability_metrics)."""
+    pc = np.clip(np.asarray(p, dtype=float), _EPS, 1.0 - _EPS)
+    return -(y * np.log(pc) + (1.0 - y) * np.log1p(-pc))
+
+
+def _paired_logloss_diff_ci(
+    y: np.ndarray,
+    p_model,
+    p_base,
+    series_id=None,
+    n_boot: int = 2000,
+    seed: int = 0,
+    level: float = 0.95,
+) -> tuple[float, float, float]:
+    """Bootstrap CI on the mean per-game logloss difference (model - baseline).
+
+    Paired by construction: the difference is taken game by game, so shared
+    hard/easy games cancel.  When ``series_id`` is given, whole series are
+    resampled with replacement (cluster bootstrap — games within a series
+    are dependent); otherwise rows are resampled.  Deterministic given
+    ``seed``.  Negative values mean the model is better (lower logloss).
+
+    Returns ``(mean_diff, ci_lo, ci_hi)``.
+    """
+    diff = _per_game_logloss(y, p_model) - _per_game_logloss(y, p_base)
+    if series_id is not None:
+        _, inv = np.unique(np.asarray(series_id), return_inverse=True)
+        sums = np.bincount(inv, weights=diff)
+        counts = np.bincount(inv).astype(float)
+    else:
+        sums = diff
+        counts = np.ones_like(diff)
+
+    rng = np.random.default_rng(seed)
+    n_c = len(sums)
+    means = np.empty(n_boot, dtype=float)
+    for i in range(n_boot):
+        sel = rng.integers(0, n_c, size=n_c)
+        means[i] = sums[sel].sum() / counts[sel].sum()
+    alpha = (1.0 - level) / 2.0
+    lo, hi = np.quantile(means, [alpha, 1.0 - alpha])
+    return float(diff.mean()), float(lo), float(hi)
 
 
 def _max_drawdown(bets_settled: pd.DataFrame) -> float:
@@ -213,6 +293,8 @@ def summarize(
     preds: pd.DataFrame,
     bets_settled: pd.DataFrame | None = None,
     synthetic_odds: bool = True,
+    n_boot: int = 2000,
+    seed: int = 0,
 ) -> tuple[dict, str]:
     """Full evaluation summary: (metrics dict, human-readable report text).
 
@@ -220,6 +302,18 @@ def summarize(
     (needs ``blue_win`` + ``model_p``; scores ``baseline_p``, ``fair_blue``
     and a per-fold table when the columns are present).  Baseline rows always
     include the trivial constants 0.5 and the in-sample blue rate.
+
+    When ``baseline_p`` is present, the headline model-vs-baseline comparison
+    gets a paired uncertainty estimate: a seeded ``n_boot``-rep bootstrap
+    (cluster-resampled by ``series_id`` when that column exists, else by row)
+    of the mean per-game logloss difference (model minus baseline; negative =
+    model better), reported as ``logloss_diff_mean`` /
+    ``logloss_diff_ci_lo`` / ``logloss_diff_ci_hi``.
+
+    When the series columns (``series_id``, ``game_in_series``,
+    ``blue_team``, ``red_team``) are present, a :func:`momentum_test` section
+    is added under the ``"momentum"`` key (``None`` otherwise), including its
+    interpretation caveat.
 
     ``bets_settled`` is :func:`~lolpred.backtest.betting.settle_bets` output
     (columns ``won, pnl, ret, stake_frac, odds``); when given, a betting
@@ -240,6 +334,25 @@ def summarize(
     models["const_bluerate(in-sample)"] = probability_metrics(y, np.full(n, blue_rate))
     if "fair_blue" in preds.columns:
         models["market_fair(devig)"] = probability_metrics(y, preds["fair_blue"])
+
+    # ---- paired model-vs-baseline logloss diff (bootstrap CI) --------------
+    ll_diff = None
+    if "baseline_p" in preds.columns:
+        series_id = preds["series_id"] if "series_id" in preds.columns else None
+        ll_diff = _paired_logloss_diff_ci(
+            y.astype(float),
+            preds["model_p"],
+            preds["baseline_p"],
+            series_id=series_id,
+            n_boot=n_boot,
+            seed=seed,
+        )
+
+    # ---- momentum (iid-violation) check ------------------------------------
+    momentum = None
+    momentum_cols = {"series_id", "game_in_series", "blue_team", "red_team"}
+    if momentum_cols <= set(preds.columns):
+        momentum = momentum_test(preds, seed=seed)
 
     # ---- per-fold table ----------------------------------------------------
     per_fold = None
@@ -273,8 +386,13 @@ def summarize(
         "per_fold": per_fold,
         "ece": model_ece,
         "reliability": rel,
+        "momentum": momentum,
         "betting": betting,
     }
+    if ll_diff is not None:
+        result["logloss_diff_mean"] = ll_diff[0]
+        result["logloss_diff_ci_lo"] = ll_diff[1]
+        result["logloss_diff_ci_hi"] = ll_diff[2]
 
     # ---- text report -------------------------------------------------------
     lines: list[str] = []
@@ -291,6 +409,14 @@ def summarize(
         lines.append(
             f"{name:<{name_w}}  {m['n']:>6d}  {m['accuracy']:>8.4f}  "
             f"{m['brier']:>7.4f}  {m['logloss']:>8.4f}"
+        )
+    if ll_diff is not None:
+        mean_d, lo_d, hi_d = ll_diff
+        how = "series-cluster" if "series_id" in preds.columns else "row"
+        lines.append(
+            f"paired logloss diff (model - baseline): {mean_d:+.4f} "
+            f"(95% {how}-bootstrap CI [{lo_d:+.4f}, {hi_d:+.4f}]); "
+            "negative = model better"
         )
     lines.append("")
 
@@ -320,6 +446,16 @@ def summarize(
             f"{int(r['bin']):>3d}  {int(r['n']):>6d}  {r['p_mean']:>7.4f}  {r['y_rate']:>7.4f}"
         )
     lines.append("")
+
+    if momentum is not None:
+        lines.append("-- Momentum (within-series iid-violation check) --")
+        lines.append(
+            f"lag_coef: {momentum['lag_coef']:+.4f}   "
+            f"sign_stability: {momentum['sign_stability']:.3f}   "
+            f"n: {momentum['n']}"
+        )
+        lines.append(f"caveat: {momentum['caveat']}")
+        lines.append("")
 
     if betting is not None:
         tag = f" {_SYNTHETIC_TAG}" if synthetic_odds else ""

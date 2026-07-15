@@ -53,6 +53,12 @@ MIN_TEST_GAMES = 50
 #: A fold whose training slice is smaller than this is skipped (cannot fit).
 _MIN_TRAIN_ROWS = 30
 
+#: Minimum held-out tail size (rows) before it is split into separate
+#: early-stopping and calibration halves.  Below this, splitting makes both
+#: jobs worse (early stopping gets a noisy stopping signal AND the Platt fit
+#: gets too few points), so the whole tail does double duty as val set.
+_MIN_TAIL_FOR_CAL_SPLIT = 200
+
 
 @dataclass(frozen=True)
 class FoldSpec:
@@ -109,6 +115,10 @@ def make_folds(
     burn = pd.Timestamp(burn_in_end)
     if dmin > burn:
         # Burn-in fallback: first 30% of the observed span (module docstring).
+        # This uses max(dates), which is technically future-dependent, but it
+        # is harmless: it only PLACES fold boundaries and carries no outcome
+        # information — every fold still trains strictly on the past and
+        # tests strictly on the future of its own boundary.
         burn = (dmin + 0.30 * (dmax - dmin)).normalize()
 
     hold = pd.Timestamp(holdout_start) if holdout_start is not None else None
@@ -197,14 +207,27 @@ def run_walkforward(
         Output of :func:`make_folds` (each fold carries its own ``gap_days``).
     model_factory / baseline_factory:
         Zero-arg callables returning fresh unfitted models per fold; both
-        must expose ``fit(X, y, X_val, y_val)`` and ``predict_proba(X)``.
+        must expose ``fit(X, y, X_val, y_val)`` and ``predict_proba(X)``,
+        and the model factory's ``fit`` must additionally accept
+        ``X_cal``/``y_cal`` keyword args (they are only passed when a
+        calibration slice exists — see ``calib_frac``).  The baseline is fit
+        on the FULL training slice (tail included) with no validation set:
+        it uses neither early stopping nor calibration, so withholding the
+        most recent rows from it would only handicap it.
         Defaults: ``WinModel(seed=seed)`` / ``EloLogisticBaseline(seed=seed)``.
     calib_frac:
         Within each fold's training slice, the chronologically LAST
-        ``calib_frac`` of rows becomes the validation set used for early
-        stopping and Platt calibration; the models never see it as training
-        rows.  If the split would leave < 2 validation rows, the fold is fit
-        without a validation set.
+        ``calib_frac`` of rows is held out of the model's training rows.
+        When that tail has at least ``_MIN_TAIL_FOR_CAL_SPLIT`` (200) rows it
+        is split chronologically in half: the FIRST half is the
+        early-stopping validation set (``X_val``/``y_val``) and the SECOND
+        (most recent) half is the calibration slice (``X_cal``/``y_cal``),
+        so the Platt calibrator is not fit on the same rows the stopping
+        point was chosen on.  Smaller tails keep the old single-slice
+        behavior (the whole tail is ``X_val``, no ``X_cal``): splitting a
+        tiny tail makes both jobs worse — a noisier stopping signal AND too
+        few calibration points.  If the tail would have < 2 rows, the fold
+        is fit without a validation set at all.
     verbose:
         Log per-fold progress at INFO (else DEBUG).
 
@@ -251,18 +274,35 @@ def run_walkforward(
             )
             continue
 
-        # Chronologically last calib_frac of the training slice -> validation.
-        n_val = min(int(round(calib_frac * len(tr_idx))), len(tr_idx) - 1)
-        if n_val >= 2:
-            fit_idx, val_idx = tr_idx[:-n_val], tr_idx[-n_val:]
-            X_val: pd.DataFrame | None = X_all.iloc[val_idx]
-            y_val: np.ndarray | None = y_all[val_idx]
+        # Chronologically last calib_frac of the training slice -> held-out
+        # tail.  Large tails are split in half: first half = early-stopping
+        # val, second (most recent) half = calibration slice; small tails do
+        # double duty as val only (see the calib_frac docstring).
+        n_tail = min(int(round(calib_frac * len(tr_idx))), len(tr_idx) - 1)
+        X_val: pd.DataFrame | None = None
+        y_val: np.ndarray | None = None
+        X_cal: pd.DataFrame | None = None
+        y_cal: np.ndarray | None = None
+        if n_tail >= 2:
+            fit_idx, tail_idx = tr_idx[:-n_tail], tr_idx[-n_tail:]
+            if n_tail >= _MIN_TAIL_FOR_CAL_SPLIT:
+                half = n_tail // 2
+                val_idx, cal_idx = tail_idx[:half], tail_idx[half:]
+                X_cal, y_cal = X_all.iloc[cal_idx], y_all[cal_idx]
+            else:
+                val_idx = tail_idx
+            X_val, y_val = X_all.iloc[val_idx], y_all[val_idx]
         else:
-            fit_idx, X_val, y_val = tr_idx, None, None
+            fit_idx = tr_idx
 
         X_tr, y_tr = X_all.iloc[fit_idx], y_all[fit_idx]
-        model = model_factory().fit(X_tr, y_tr, X_val, y_val)
-        baseline = baseline_factory().fit(X_tr, y_tr, X_val, y_val)
+        if X_cal is not None:
+            model = model_factory().fit(X_tr, y_tr, X_val, y_val, X_cal=X_cal, y_cal=y_cal)
+        else:
+            model = model_factory().fit(X_tr, y_tr, X_val, y_val)
+        # Baseline: full training slice (tail included), no val/cal — it has
+        # no early stopping or calibration to feed, so it gets all the data.
+        baseline = baseline_factory().fit(X_all.iloc[tr_idx], y_all[tr_idx])
 
         X_te, y_te = X_all.iloc[te_idx], y_all[te_idx]
         model_p = np.asarray(model.predict_proba(X_te), dtype=float)
@@ -277,14 +317,15 @@ def run_walkforward(
 
         logger.log(
             level,
-            "fold %d%s: test %s..%s | train=%d (val=%d) test=%d | "
+            "fold %d%s: test %s..%s | train=%d (val=%d cal=%d) test=%d | "
             "logloss model=%.4f baseline=%.4f",
             fold_id,
             " [holdout]" if fold.is_holdout else "",
             fold.test_start.date(),
             fold.test_end.date(),
             len(tr_idx),
-            len(tr_idx) - len(fit_idx),
+            0 if X_val is None else len(X_val),
+            0 if X_cal is None else len(X_cal),
             len(te_idx),
             _fold_logloss(y_te, model_p),
             _fold_logloss(y_te, baseline_p),

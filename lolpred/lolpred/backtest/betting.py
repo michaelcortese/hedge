@@ -263,6 +263,18 @@ def settle_bets(bets: pd.DataFrame, blue_win) -> pd.DataFrame:
         outcomes = blue_win.loc[bets.index].to_numpy()
     else:
         arr = np.asarray(blue_win)
+        if len(bets) and not pd.api.types.is_integer_dtype(bets.index):
+            # A plain array cannot be aligned to a non-integer bets index:
+            # the index values are not positions into the array, and silently
+            # falling back to positional order could grade bets against the
+            # wrong games.  (Previously this fell through to a confusing
+            # numpy comparison error inside `idx.max() >= len(arr)`.)
+            raise TypeError(
+                "settle_bets: cannot align array outcomes to a non-integer "
+                f"bets index (dtype {bets.index.dtype}); pass blue_win as a "
+                "pandas Series indexed like the bets (label alignment), or "
+                "use integer positional indices on the bets frame"
+            )
         idx = np.asarray(bets.index)
         if len(arr) == len(bets) and (len(bets) == 0 or idx.max(initial=-1) >= len(arr)):
             outcomes = arr
@@ -287,6 +299,14 @@ def simulate_bankroll(bets_settled: pd.DataFrame, start: float = 1.0, compound: 
     ``compound=True``, else ``stake_frac * start`` (flat fractions of the
     starting bankroll). Bankroll then moves by ``+amount * (odds - 1)`` on a
     win and ``-amount`` on a loss.
+
+    Note on ``compound=False`` (flat staking): every bet risks a fixed
+    fraction of the START bankroll regardless of the current balance, so a
+    long losing streak can drive the bankroll below zero.  This is
+    intentionally NOT floored at zero — flat mode is a *diagnostic* arm
+    (linear in per-bet pnl, a miscalibration canary vs the Kelly arm), not a
+    simulation of playable staking; flooring would silently censor exactly
+    the tail it exists to expose.
 
     Returns a Series of the bankroll AFTER each bet, aligned to the bets'
     index in order.

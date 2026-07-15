@@ -141,6 +141,16 @@ class TestMomentumTest:
         r2 = momentum_test(preds, seed=0)
         assert r1 == r2
 
+    def test_caveat_field_present(self):
+        preds = make_series_frame(n_series=100, momentum=0.0, seed=3)
+        res = momentum_test(preds, seed=0)
+        assert "caveat" in res
+        assert "momentum OR model misspecification" in res["caveat"]
+        # degenerate input carries the caveat too
+        tiny = preds.head(3)
+        res_tiny = momentum_test(tiny, seed=0)
+        assert "caveat" in res_tiny
+
 
 # ------------------------------------------------------------------ summarize
 
@@ -189,7 +199,11 @@ class TestSummarize:
         bets = make_settled_bets()
         result, text = summarize(preds, bets_settled=bets, synthetic_odds=True)
 
-        assert set(result) == {"n", "models", "per_fold", "ece", "reliability", "betting"}
+        assert set(result) == {
+            "n", "models", "per_fold", "ece", "reliability", "momentum",
+            "betting", "logloss_diff_mean", "logloss_diff_ci_lo",
+            "logloss_diff_ci_hi",
+        }
         assert result["n"] == len(preds)
         for name in ("model", "baseline_elo_bt", "const_0.5",
                      "const_bluerate(in-sample)", "market_fair(devig)"):
@@ -209,6 +223,61 @@ class TestSummarize:
         assert "SYNTHETIC ODDS" in text
         assert "Betting" in text
         assert "const_bluerate(in-sample)" in text
+
+        # paired logloss diff: keys coherent, sign convention stated in text
+        assert result["logloss_diff_ci_lo"] <= result["logloss_diff_mean"]
+        assert result["logloss_diff_mean"] <= result["logloss_diff_ci_hi"]
+        assert "paired logloss diff (model - baseline)" in text
+        assert "negative = model better" in text
+        # no series_id column -> row bootstrap, momentum not computable
+        assert "row-bootstrap" in text
+        assert result["momentum"] is None
+
+    def test_logloss_diff_detects_better_model(self):
+        # model_p is the true probability, baseline heavily noised -> the
+        # paired diff must be significantly negative (model better).
+        rng = np.random.default_rng(11)
+        n = 4000
+        p = rng.uniform(0.2, 0.8, size=n)
+        preds = pd.DataFrame(
+            {
+                "blue_win": (rng.random(n) < p).astype(int),
+                "model_p": p,
+                "baseline_p": np.clip(p + rng.normal(0, 0.25, n), 0.01, 0.99),
+            }
+        )
+        result, _ = summarize(preds)
+        assert result["logloss_diff_mean"] < 0.0
+        assert result["logloss_diff_ci_hi"] < 0.0  # CI excludes zero
+
+    def test_logloss_diff_deterministic(self):
+        preds = make_preds()
+        r1, t1 = summarize(preds, seed=3)
+        r2, t2 = summarize(preds, seed=3)
+        assert r1["logloss_diff_ci_lo"] == r2["logloss_diff_ci_lo"]
+        assert r1["logloss_diff_ci_hi"] == r2["logloss_diff_ci_hi"]
+        assert t1 == t2
+
+    def test_momentum_section_with_series_columns(self):
+        preds = make_series_frame(n_series=200, momentum=0.0, seed=8)
+        result, text = summarize(preds)
+        assert result["momentum"] is not None
+        assert result["momentum"]["n"] == 200 * 2
+        assert "Momentum" in text
+        assert "momentum OR model misspecification" in text  # the caveat
+        # series_id present -> the logloss-diff bootstrap would be
+        # cluster-based, but there is no baseline_p here
+        assert "logloss_diff_mean" not in result
+
+    def test_series_cluster_bootstrap_labeled(self):
+        preds = make_series_frame(n_series=200, momentum=0.0, seed=8)
+        rng = np.random.default_rng(4)
+        preds["baseline_p"] = np.clip(
+            preds["model_p"] + rng.normal(0, 0.05, len(preds)), 0.01, 0.99
+        )
+        result, text = summarize(preds)
+        assert "series-cluster-bootstrap" in text
+        assert "logloss_diff_mean" in result
 
     def test_synthetic_tag_absent_when_real_odds(self):
         result, text = summarize(

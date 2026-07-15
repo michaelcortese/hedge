@@ -349,6 +349,19 @@ class BradleyTerry:
         )
 
     def _fit(self, fit_date: pd.Timestamp) -> None:
+        # Leakage guard: _fit is a pregame-time operation, so every buffered
+        # game must predate (or share) fit_date.  A future-dated game means
+        # the caller observed a game before its pregame moment — silently
+        # clamping its decay weight (the old `max(0.0, days_before)`) would
+        # hide that bug, so fail loudly instead.
+        future = [g[0] for g in self._history if g[0] > fit_date]
+        if future:
+            raise ValueError(
+                f"BradleyTerry._fit(fit_date={fit_date}): {len(future)} "
+                f"history game(s) are dated after fit_date (latest: "
+                f"{max(future)}) — future games must never be observed "
+                "before a pregame fit (leakage guard)"
+            )
         # Truncate to the decay horizon: games older than
         # max_age_half_lives half-lives carry negligible weight
         # (0.5**4 ~= 6%) but grow the design matrix and the O(n_teams^3)
@@ -378,7 +391,8 @@ class BradleyTerry:
             vals[2 * i] = 1.0
             vals[2 * i + 1] = -1.0
             y[i] = win
-            days_before = max(0.0, (fit_date - gdate) / day)
+            # Non-negative by the leakage guard above (gdate <= fit_date).
+            days_before = (fit_date - gdate) / day
             w[i] = 0.5 ** (days_before / self.half_life_days)
 
         X = sp.csr_matrix(
