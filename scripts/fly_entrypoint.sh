@@ -24,15 +24,30 @@ case "${HEDGE_LIVE:-0}" in
   1|true|TRUE|yes|on) LIVE="--live" ;;
 esac
 
-echo "[entrypoint] reconciler=${LIVE:-dry-run} + paper loop, interval=${INTERVAL}s"
+echo "[entrypoint] reconciler=${LIVE:-dry-run} + paper loop + wing-maker paper, interval=${INTERVAL}s"
 
 # Background: reconcile + settlement booking (+ management preview/execution if armed).
 # shellcheck disable=SC2086
 python -m hedge.runner $LIVE --interval "$INTERVAL" --allow-prod &
 RECONCILER_PID=$!
 
-# If this script is told to stop, pass it on to the background reconciler too.
-trap 'kill "$RECONCILER_PID" 2>/dev/null || true' INT TERM
+# Background: Wing Maker paper-markout harness (docs/PERP_STRATEGY.md §8.1).
+# Keyless, read-only, quotes nothing for real; JSONL logs on the durable volume.
+# Runs in 24h segments under a restart loop so a crash never takes the day down.
+export WINGMAKER_DATA_DIR="${HEDGE_STATE_DIR:-/data}/wingmaker"
+mkdir -p "$WINGMAKER_DATA_DIR"
+(
+  while true; do
+    python scripts/paper_wingmaker.py run --minutes 1440 \
+      >> "$WINGMAKER_DATA_DIR/run.log" 2>&1 || true
+    echo "[entrypoint] wing-maker segment ended; restarting in 15s"
+    sleep 15
+  done
+) &
+WINGMAKER_PID=$!
+
+# If this script is told to stop, pass it on to the background loops too.
+trap 'kill "$RECONCILER_PID" "$WINGMAKER_PID" 2>/dev/null || true' INT TERM
 
 # Foreground: the paper edge-evidence loop against keyless prod market data.
 exec python scripts/run_paper.py loop --interval "$INTERVAL" --prod
