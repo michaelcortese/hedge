@@ -14,6 +14,7 @@ import pytest
 
 from lolpred.backtest.kalshi_eval import (
     DISCLAIMER,
+    KALSHI_TEAM_ALIASES,
     evaluate,
     join_markets_to_series,
     kalshi_taker_fee,
@@ -163,6 +164,133 @@ def test_join_nearest_of_two(feats):
     assert len(j) == 1
     assert j["series_id"].iloc[0] == "S5"  # nearest in time wins
     assert j.attrs["n_ambiguous"] >= 1
+
+
+# ------------------------------------------------------------ alias fallback
+
+
+@pytest.fixture()
+def alias_feats():
+    """Series whose feature-table names differ from the Kalshi spellings,
+    exercising real KALSHI_TEAM_ALIASES entries."""
+    rows = [
+        # Kalshi says "DRX"; the feature table says "Kiwoom DRX".
+        mk_game("a1", "2026-07-01 08:00", "SA1", 1,
+                "Kiwoom DRX", "Hanwha Life Esports", 1, elo_diff=1.0),
+        # The SAME org under both feature-table spellings (raw-first case):
+        mk_game("a2", "2026-07-05 08:00", "SA2", 1,
+                "Team Secret Whales", "MVK Esports", 1, elo_diff=1.0),
+        mk_game("a3", "2026-07-12 08:00", "SA3", 1,
+                "Team Secret (Vietnamese Team)", "Sentinels", 0, elo_diff=1.0),
+    ]
+    return pd.DataFrame(rows)
+
+
+def test_join_via_alias(alias_feats):
+    assert KALSHI_TEAM_ALIASES["DRX"] == "Kiwoom DRX"
+    markets = pd.DataFrame([
+        mk_market("M1", "DRX", "Hanwha Life Esports", "2026-07-01 09:00", 1,
+                  0.5, 0.55),
+    ])
+    j = join_markets_to_series(markets, alias_feats)
+    assert len(j) == 1
+    assert j["series_id"].iloc[0] == "SA1"
+    assert j.attrs["n_matched"] == 1 and j.attrs["n_unmatched"] == 0
+    assert j.attrs["n_extended_window"] == 0
+
+
+def test_join_raw_name_wins_over_alias(alias_feats):
+    # Both Kalshi names are alias keys pointing at "Team Secret (Vietnamese
+    # Team)", but the feature table ALSO carries the raw spellings — the raw
+    # match must win so an alias can never break a pre-existing match.
+    assert "Team Secret Whales" in KALSHI_TEAM_ALIASES
+    markets = pd.DataFrame([
+        # raw spelling exists in feats -> matched to SA2, not dropped
+        mk_market("M1", "Team Secret Whales", "MVK Esports",
+                  "2026-07-05 09:00", 1, 0.5, 0.55),
+        # raw spelling absent -> matched via the alias to SA3
+        mk_market("M2", "Team Secret", "Sentinels",
+                  "2026-07-12 09:00", 0, 0.4, 0.45),
+    ])
+    j = join_markets_to_series(markets, alias_feats)
+    assert j.set_index("ticker").loc["M1", "series_id"] == "SA2"
+    assert j.set_index("ticker").loc["M2", "series_id"] == "SA3"
+    assert j.attrs["n_unmatched"] == 0
+
+
+def test_model_series_prob_accepts_aliased_yes_team(alias_feats):
+    # FlatModel: elo_diff=+1 -> p_bar = 0.6 for game-1 blue = Kiwoom DRX.
+    p_alias, bo = model_series_prob(FlatModel(), alias_feats, "SA1", "DRX")
+    assert bo == 1
+    assert p_alias == pytest.approx(0.6)
+    p_raw, _ = model_series_prob(FlatModel(), alias_feats, "SA1", "Kiwoom DRX")
+    assert p_raw == pytest.approx(p_alias)
+    # aliased opponent-side name flips
+    p_opp, _ = model_series_prob(FlatModel(), alias_feats, "SA1",
+                                 "Hanwha Life Esports")
+    assert p_opp == pytest.approx(1.0 - p_alias)
+
+
+# ----------------------------------------------------- extended time window
+
+
+def _one_series(date_str):
+    return [mk_game(f"e{i}", d, f"SE{i}", 1, "Alpha Wolves", "Beta Bears", 1,
+                    elo_diff=1.0)
+            for i, d in enumerate(date_str)]
+
+
+def test_extended_window_single_unambiguous_candidate():
+    feats = pd.DataFrame(_one_series(["2026-07-20 08:00"]))
+    # 1.83 days off: outside the strict 1.5d window, inside 2.5d, and the
+    # only candidate within 4d -> rescued.
+    markets = pd.DataFrame([
+        mk_market("M1", "Alpha Wolves", "Beta Bears", "2026-07-22 04:00", 1,
+                  0.5, 0.55),
+    ])
+    j = join_markets_to_series(markets, feats)
+    assert len(j) == 1
+    assert j["series_id"].iloc[0] == "SE0"
+    assert j.attrs["n_extended_window"] == 1
+    assert j.attrs["n_unmatched"] == 0
+
+
+def test_extended_window_ambiguity_guard():
+    # Two meetings of the same pair within 4 days of the market -> even
+    # though the nearest is inside 2.5d, the guard refuses to guess.
+    feats = pd.DataFrame(_one_series(["2026-07-20 08:00", "2026-07-24 20:00"]))
+    markets = pd.DataFrame([
+        # gaps: 1.92d and 2.58d -> none within 1.5d, two within 4d
+        mk_market("M1", "Alpha Wolves", "Beta Bears", "2026-07-22 06:00", 1,
+                  0.5, 0.55),
+    ])
+    j = join_markets_to_series(markets, feats)
+    assert len(j) == 0
+    assert j.attrs["unmatched_reasons"] == {"no_series_within_time_window": 1}
+    assert j.attrs["n_extended_window"] == 0
+
+
+def test_extended_window_hard_cap():
+    feats = pd.DataFrame(_one_series(["2026-07-20 08:00"]))
+    markets = pd.DataFrame([
+        # 3.0 days off: single candidate, but beyond the 2.5d extension
+        mk_market("M1", "Alpha Wolves", "Beta Bears", "2026-07-23 08:00", 1,
+                  0.5, 0.55),
+    ])
+    j = join_markets_to_series(markets, feats)
+    assert len(j) == 0
+    assert j.attrs["unmatched_reasons"] == {"no_series_within_time_window": 1}
+
+
+def test_in_window_match_never_counts_as_extended():
+    feats = pd.DataFrame(_one_series(["2026-07-20 08:00"]))
+    markets = pd.DataFrame([
+        mk_market("M1", "Alpha Wolves", "Beta Bears", "2026-07-20 12:00", 1,
+                  0.5, 0.55),
+    ])
+    j = join_markets_to_series(markets, feats)
+    assert len(j) == 1
+    assert j.attrs["n_extended_window"] == 0
 
 
 # ------------------------------------------------------------- series pricing

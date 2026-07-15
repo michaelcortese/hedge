@@ -37,6 +37,7 @@ from lolpred.models.xgb import PERSP_COL
 from lolpred.series import series_win_prob
 
 __all__ = [
+    "KALSHI_TEAM_ALIASES",
     "join_markets_to_series",
     "model_series_prob",
     "evaluate",
@@ -85,6 +86,64 @@ def kalshi_taker_fee(price: float) -> float:
 
 # ------------------------------------------------------------------------ join
 
+#: Kalshi market team name -> the team's name in the feature table (Oracle's
+#: Elixir / Leaguepedia spelling).  EXACT-string keyed, applied to market names
+#: only, before :func:`normalize_team` — deliberately no fuzzy matching.
+#:
+#: Every entry was verified against the 2026 feature table by requiring
+#: corroboration: with the alias applied, the market's team PAIR matches a
+#: series within the join window for >= 2 distinct events with a consistent
+#: league (e.g. Kalshi "DRX" markets all land on "Kiwoom DRX" LCK series).
+#: The three single-event entries (Team Secret / INTZ e-Sports / Lodis) are
+#: exact-name identities where the feature table only adds a disambiguation
+#: parenthetical or house casing.  Kalshi "ZEN Esports" is a true homonym
+#: (Argentinian and Vietnamese orgs); it is mapped to the Argentinian team
+#: (7 corroborating events vs 1) and the Vietnamese markets stay unmatched
+#: rather than risk a wrong join.
+#:
+#: The alias is a FALLBACK: the join always tries the raw Kalshi name first,
+#: so an alias can only ever add matches, never break one.  This matters
+#: because the feature table itself is inconsistent — e.g. it names the same
+#: org "Team Secret Whales" in LCP/MSI rows but "Team Secret (Vietnamese
+#: Team)" in EWC rows.
+KALSHI_TEAM_ALIASES: dict[str, str] = {
+    # LCK / LCK CL 2026 rebrands and spelling variants
+    "DRX": "Kiwoom DRX",
+    "DRX Challengers": "Kiwoom DRX Challengers",
+    "OKSavingsBank BRION": "HANJIN BRION",
+    "OKSavingsBank BRION Challengers": "HANJIN BRION Challengers",
+    "Nongshim Red Force": "Nongshim RedForce",
+    "T1 Academy": "T1 Esports Academy",
+    # Americas
+    "LOS": "LØS",                                  # CBLOL (unicode Ø)
+    "LYON": "LYON (2024 American Team)",           # LTA N / LCS
+    "Lyon Gaming Academy": "LYON Academy",         # Liga Regional Norte
+    "ZEN Esports": "ZEN Esports (Argentinian Team)",
+    "INTZ e-Sports": "INTZ",
+    # EMEA
+    "Team Orange Gaming": "TeamOrangeGaming",      # Prime League
+    "UCAM Esports Club": "UCAM Esports",           # LES
+    "Los Heretics": "Team Heretics Academy",       # LES
+    "GIANTX PRIDE": "GIANTX iTero",                # LES
+    "The Otter Side": "Otter Side",                # LPLOL
+    "Senshi Esports Club": "Senshi eSports (Benelux Team)",
+    "The Ruddy Sack": "Ruddy Corporation",         # NLC
+    "Forsaken": "Forsaken (Polish Team)",          # Rift Legends
+    "Orbit Anonymo": "Anonymo Esports",            # Rift Legends
+    "devils.one x KMT": "devils.one inStreamly",   # Rift Legends
+    "Orzel Barczaca Esports": "Barcząca Esports",  # Rift Legends
+    "Lodis": "LODIS (Polish Team)",                # Rift Legends
+    # Asia-Pacific
+    "Team Secret Whales": "Team Secret (Vietnamese Team)",  # LCP
+    "Team Secret": "Team Secret (Vietnamese Team)",
+}
+
+
+def _norm_market_team(name: str) -> str:
+    """Normalize a KALSHI-side team name: exact alias first, then the shared
+    :func:`normalize_team`.  Feature-table names never go through the alias."""
+    return normalize_team(KALSHI_TEAM_ALIASES.get(name, name))
+
 
 def _to_utc(ts) -> pd.Timestamp:
     """Coerce to a tz-aware UTC Timestamp (naive timestamps are UTC by
@@ -94,7 +153,11 @@ def _to_utc(ts) -> pd.Timestamp:
 
 
 def join_markets_to_series(
-    markets: pd.DataFrame, feats: pd.DataFrame, max_days: float = 1.5
+    markets: pd.DataFrame,
+    feats: pd.DataFrame,
+    max_days: float = 1.5,
+    ext_max_days: float = 2.5,
+    ext_unambiguous_days: float = 4.0,
 ) -> pd.DataFrame:
     """Join Kalshi match markets to series in the feature table.
 
@@ -109,13 +172,24 @@ def join_markets_to_series(
                 normalize_team(red_team of game 1)}
 
     and ``|game-1 date - match_start| <= max_days`` (game-1 dates are naive
-    UTC; ``match_start`` is tz-aware UTC).  When several candidate series
-    match, the nearest in time is taken and the ambiguity is counted/logged.
+    UTC; ``match_start`` is tz-aware UTC).  If the RAW market names find no
+    series, the pair is retried with :data:`KALSHI_TEAM_ALIASES` applied
+    (raw-first, so an alias can only add matches).  When several candidate
+    series match, the nearest in time is taken and the ambiguity is
+    counted/logged.
+
+    Day-boundary rescue: when NO candidate sits within ``max_days`` but the
+    nearest one is within ``ext_max_days`` AND it is the ONLY candidate for
+    that team pair within ``ext_unambiguous_days`` (the ambiguity guard), it
+    is taken and counted under ``n_extended_window``.  This absorbs
+    Leaguepedia-date vs Kalshi-UTC day-boundary/reschedule artifacts without
+    letting a market jump to a different meeting of the same two teams.
 
     Returns one row per MATCHED market: all market columns plus ``series_id``,
     ``game1_gameid``, ``game1_date``, ``n_games_in_series``, ``league``.
     Join diagnostics are stashed in ``df.attrs``: ``n_input``, ``n_matched``,
-    ``n_unmatched``, ``unmatched_reasons`` (counter dict) and ``n_ambiguous``.
+    ``n_unmatched``, ``unmatched_reasons`` (counter dict), ``n_ambiguous``
+    and ``n_extended_window``.
     """
     f = feats.sort_values(["series_id", "game_in_series"], kind="stable")
     g1 = f.drop_duplicates("series_id", keep="first")
@@ -133,8 +207,11 @@ def join_markets_to_series(
         by_key.setdefault(key, []).append(j)
 
     max_seconds = float(max_days) * 86400.0
+    ext_seconds = float(ext_max_days) * 86400.0
+    guard_seconds = float(ext_unambiguous_days) * 86400.0
     reasons: Counter = Counter()
     n_ambiguous = 0
+    n_extended = 0
     out_rows: list[dict] = []
 
     for _, mkt in markets.iterrows():
@@ -146,23 +223,45 @@ def join_markets_to_series(
         if pd.isna(ms):
             reasons["bad_match_start"] += 1
             continue
-        key = frozenset(
-            (normalize_team(str(mkt["yes_team"])), normalize_team(str(mkt["opp_team"])))
-        )
-        idxs = by_key.get(key)
-        if not idxs:
-            reasons["no_series_for_team_pair"] += 1
+        yes, opp = str(mkt["yes_team"]), str(mkt["opp_team"])
+        raw_key = frozenset((normalize_team(yes), normalize_team(opp)))
+        alias_key = frozenset((_norm_market_team(yes), _norm_market_team(opp)))
+        keys = [raw_key] if alias_key == raw_key else [raw_key, alias_key]
+
+        j = None
+        any_candidates = False
+        via_extended = False
+        for key in keys:
+            idxs = by_key.get(key)
+            if not idxs:
+                continue
+            any_candidates = True
+            dts = np.array(
+                [abs((cand_date_utc[i] - ms).total_seconds()) for i in idxs],
+                dtype=float,
+            )
+            ok = dts <= max_seconds
+            if ok.any():
+                if int(ok.sum()) > 1:
+                    n_ambiguous += 1
+                j = idxs[int(np.argmin(np.where(ok, dts, np.inf)))]
+                via_extended = False
+                break
+            if dts.min() <= ext_seconds and int((dts <= guard_seconds).sum()) == 1:
+                # Day-boundary rescue: single unambiguous candidate just
+                # outside the strict window (see docstring).  Kept only if no
+                # later key finds an in-window match.
+                if j is None:
+                    j = idxs[int(np.argmin(dts))]
+                    via_extended = True
+        if j is None:
+            reasons[
+                "no_series_within_time_window" if any_candidates
+                else "no_series_for_team_pair"
+            ] += 1
             continue
-        dts = np.array(
-            [abs((cand_date_utc[j] - ms).total_seconds()) for j in idxs], dtype=float
-        )
-        ok = dts <= max_seconds
-        if not ok.any():
-            reasons["no_series_within_time_window"] += 1
-            continue
-        if int(ok.sum()) > 1:
-            n_ambiguous += 1
-        j = idxs[int(np.argmin(np.where(ok, dts, np.inf)))]
+        if via_extended:
+            n_extended += 1
 
         row = mkt.to_dict()
         sid = cand_series[j]
@@ -182,10 +281,17 @@ def join_markets_to_series(
     out.attrs["n_unmatched"] = int(len(markets) - len(out))
     out.attrs["unmatched_reasons"] = dict(reasons)
     out.attrs["n_ambiguous"] = int(n_ambiguous)
+    out.attrs["n_extended_window"] = int(n_extended)
     if n_ambiguous:
         logger.info(
             "join_markets_to_series: %d markets had multiple candidate series "
             "within %.1f days (nearest taken)", n_ambiguous, max_days,
+        )
+    if n_extended:
+        logger.info(
+            "join_markets_to_series: %d markets matched via the extended "
+            "window (<= %.1f days, single candidate within %.1f days)",
+            n_extended, ext_max_days, ext_unambiguous_days,
         )
     if reasons:
         logger.info("join_markets_to_series: unmatched reasons: %s", dict(reasons))
@@ -266,10 +372,13 @@ def model_series_prob(model, feats: pd.DataFrame, series_id, yes_team: str) -> t
         )
 
     p_series_blue = series_win_prob(p_bar, best_of)
-    ny = normalize_team(str(yes_team))
-    if ny == normalize_team(str(g1["blue_team"].iloc[0])):
+    # yes_team arrives in KALSHI spelling — accept either the raw name or its
+    # KALSHI_TEAM_ALIASES form (e.g. "DRX" -> "Kiwoom DRX"), mirroring the
+    # raw-first join.
+    ny = {normalize_team(str(yes_team)), _norm_market_team(str(yes_team))}
+    if normalize_team(str(g1["blue_team"].iloc[0])) in ny:
         return float(p_series_blue), best_of
-    if ny == normalize_team(str(g1["red_team"].iloc[0])):
+    if normalize_team(str(g1["red_team"].iloc[0])) in ny:
         return float(1.0 - p_series_blue), best_of
     raise ValueError(
         f"yes_team {yes_team!r} matches neither team of series {series_id!r}"
