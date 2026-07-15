@@ -42,14 +42,15 @@ risk:
                             # Price band keeps opens out of the tails.
   manage_cooldown_cycles: 2 # don't re-act on a managed ticker for 2 cycles (anti-churn)
 
-# Per-strategy Kelly-λ multiplier (#3 "concentrate on the one real edge"). Morning
-# forecast bets have no durable edge vs an efficient mid pulling the same free feeds —
-# run them at ~0 size (paper/log only) and put size on the intraday obs-lag nowcast.
+# Per-strategy Kelly-λ multiplier (#3 "concentrate on the one real edge").
 # Missing strategy => 1.0. Composes with the guard skill multiplier below.
+# WEATHER IS SHUT DOWN (2026-07-15): realized P&L never recovered (−$75+ cumulative,
+# false-floor repeats on 6/29 and 7/1), so all weather strategies run at zero size —
+# paper/log only. Re-enable deliberately by raising a multiplier here, not by re-arming.
 strategy_lambda:
-  weather_ensemble: 0.0     # all-day forecast workhorse — no edge vs mid, log only
-  weather_blend: 0.0        # ensemble-then-nowcast; the nowcast carries size directly
-  weather_nowcast: 1.0      # the intraday obs-lag edge — the only one that carries size
+  weather_ensemble: 0.0     # no edge vs mid — log only
+  weather_blend: 0.0        # ensemble-then-nowcast — log only
+  weather_nowcast: 0.0      # intraday obs-lag thesis didn't pay after fixes — log only
 
 guard:
   enabled: true
