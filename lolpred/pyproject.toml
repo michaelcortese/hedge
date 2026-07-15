@@ -1,0 +1,27 @@
+[project]
+name = "lolpred"
+version = "0.1.0"
+description = "League of Legends esports match-outcome prediction for betting/trading: data pipeline, feature engineering, XGBoost model, walk-forward backtest, betting evaluation."
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.26",
+    "scikit-learn>=1.4",
+    "xgboost>=2.0",
+    "scipy>=1.11",
+    "pyarrow>=15.0",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["lolpred*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
