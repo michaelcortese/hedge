@@ -20,15 +20,18 @@ Protocol (binding):
 
 | id | family | idea | status |
 |----|--------|------|--------|
-| A | market-bias | favorite-longshot / side / league / time-of-day miscalibration in prices alone | round 1 |
-| B | info-blend | does model logit add info over market logit? trade only the divergence region of the blend | round 1 |
-| C | series-underreaction | Bo3/Bo5 match markets repricing after game results vs Bayesian benchmark (momentum finding says +) | pending data |
-| D | stale-early | listing/t60-era prices stale vs close; bet-early drift capture | pending data |
-| E | liquidity-provision | model-anchored two-sided quoting inside the ~5c spread; fills from trade prints; maker fee 0 | pending data |
-| F | cross-market-structure | game vs match vs outright consistency; sum-to-1 violations; sibling esports series | round 1 |
-| G | join-rescue + selection QA | raise matched n (700->~950); check match/unmatch selection bias | round 1 |
-| H | market-only-residual | ML on market features only (drift continuation, volume, OI, spread) | round 1 |
-| I | in-play | do markets trade during games? underreaction to elapsed state | pending data |
-| J | stat-protocol | the significance/multiplicity bar all candidates must pass (this table's Protocol) | round 1 |
+| A | market-bias | favorite-longshot / side / league / time-of-day miscalibration in prices alone | **DEAD** (well calibrated; slices sign-unstable; first-listed-favorite curiosity n=19, unproven) |
+| B | info-blend | does model logit add info over market logit? | **DEAD** (incremental coef +0.04, MDE 0.61; market subsumes model; model has real standalone signal) |
+| C | series-underreaction | Bo3/Bo5 match repricing after game results vs recursion benchmark + momentum | round 2 running |
+| D | stale-early | 24h->1h price-discovery window staleness; model-vs-early test | round 2 running |
+| E | liquidity-provision | two-sided quoting inside ~5c spread; conservative print-based fills; maker fee 0 | round 2 running |
+| E2 | maker thin-favorite | targeted: H's low-volume underconfidence captured with maker fills | round 2 running |
+| F | cross-market-structure | game/map/totals/outright consistency; sibling esports | **DEAD as arb** (books coherent; 1c fee floor kills residuals). **Data win: ~18k settled markets across 13 series; KXLOLMAP n=1,988 per-game markets** |
+| G | join-rescue + selection QA | | **DONE**: matched 970/1,010 via verified alias table; headline firmer (+0.066 logloss, CI [+0.043,+0.090]) |
+| H | market-only-residual | drift/flow/round-number/composite | **DEAD** except lead: low-volume calibration slope 1.56 [1.22,2.03], thin favorites +2-5c gross, fails at touch by ~2c -> handed to E2; possible May->June decay |
+| I | in-play | volume clock, in-play efficiency, resolution-drift capture | round 2 running |
+| J | stat-protocol | acceptance bar | **DONE**: edge_protocol.py; MDE: 10c needs ~292 bets, 2c unconfirmable on LoL-only; pooled multi-series data changes this |
+| K | model-vs-map-markets | game-level model vs KXLOLMAP per-game books (thinner, derivative) | queued (needs multi fetch) |
+| L | pooled thin-market | H's slope test pooled across 13 esports series (~18k markets) | queued (needs multi fetch) |
 
 Verdicts are appended below by the orchestrator as rounds complete.
