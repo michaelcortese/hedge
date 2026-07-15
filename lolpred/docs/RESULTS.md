@@ -85,3 +85,67 @@ predictions (Elo+BT logistic), not from the evaluated model. The baseline is
 an independent-ish reference only — it is trained on the same games — so
 betting numbers validate plumbing, not real market edge.
 ```
+
+# Real-market evaluation vs Kalshi (2026-07-15)
+
+Command: `scripts/eval_vs_kalshi.py --train-end 2026-05-01`
+
+```
+==========================================================================
+Model vs Kalshi evaluation
+REAL KALSHI PRICES — settled markets, executable-touch backtest, no slippage beyond the spread, assumes 1-contract fills
+==========================================================================
+window (match_start, UTC): 2026-05-09 04:00:00+00:00 .. 2026-07-15 08:30:00+00:00
+join: 700 matched / 310 unmatched of 1010 markets
+  unmatched reasons: {'no_series_for_team_pair': 214, 'no_series_within_time_window': 96}
+  ambiguous joins (nearest series taken): 18
+evaluated: 700 markets (volume filter >= 0 dropped 0; model errors dropped 0)
+
+-- Probability quality: model vs market t5 mid --
+n = 646 markets with a valid t5 mid
+name             n  accuracy    brier  logloss     ece
+model          646    0.6981   0.2092   0.6119  0.0499
+market_mid     646    0.7074   0.1848   0.5497  0.0462
+paired diffs (model - market), 95% row-bootstrap CI, n_boot=5000:
+  logloss   +0.0622 [+0.0336, +0.0917]  (negative = model better)
+  brier     +0.0245 [+0.0127, +0.0360]  (negative = model better)
+  accuracy  -0.0093 [-0.0372, +0.0186]  (positive = model better)
+
+-- P&L simulation (flat 1 contract, t5 executable touch, taker fees) --
+  thr n_bets  yes/no    hit     pnl$  pnl/bet  staked$     ROI          ROI 95% CI
+ 0.03    446 229/217  0.377    -6.96   -0.016   174.96  -0.040  [-0.139, +0.062]
+ 0.05    365 182/183  0.337   -15.97   -0.044   138.97  -0.115  [-0.228, -0.002]
+ 0.08    255 129/126  0.314   -13.66   -0.054    93.66  -0.146  [-0.286, -0.004]
+
+per-league breakdown at best threshold (by total P&L) thr=0.03:
+league           n_bets    hit     pnl$     ROI
+2026 Mid-Season Invitational     30  0.333    +4.16  +0.712
+LEC                  17  0.706    +2.34  +0.242
+LIT                   6  0.667    +1.97  +0.970
+LFL                  13  0.615    +1.83  +0.297
+LCK                  26  0.385    +1.47  +0.172
+LCP                  25  0.600    +1.43  +0.105
+Esports World Cup 2026     45  0.489    +1.24  +0.060
+LPLOL                14  0.429    +1.01  +0.202
+CBLOL                 4  0.500    +0.36  +0.220
+2026 Asia Masters     24  0.250    +0.15  +0.026
+Road Of Legends      12  0.333    +0.04  +0.010
+Prime League 1st Division     48  0.458    -0.04  -0.002
+LES                   6  0.333    -0.11  -0.052
+Hitpoint Masters      1  0.000    -0.17  -1.000
+North American Challengers League      2  0.000    -0.56  -1.000
+LPL                  43  0.326    -0.83  -0.056
+Circuito Desafiante     10  0.300    -0.97  -0.244
+LCK CL               11  0.455    -1.30  -0.206
+LCS                  10  0.400    -1.31  -0.247
+LJL                   8  0.250    -1.52  -0.432
+Hellenic Legends League      4  0.000    -1.66  -1.000
+Liga Regional Sur     22  0.364    -1.80  -0.184
+Liga Regional Norte     26  0.231    -5.57  -0.481
+EMEA Masters         39  0.077    -7.12  -0.704
+
+-- Line movement t60 -> t5 (CLV-like diagnostic) --
+n = 642   corr(sign(model - t60_mid), sign(t5_mid - t60_mid)): -0.016
+mean t60->t5 movement TOWARD the model when |model - t60_mid| > 5c: -0.0007 (n = 426; positive = market moved our way)
+
+```

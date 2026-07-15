@@ -185,6 +185,28 @@ Against a synthetic book this is *by construction* beatable and says nothing
 about beating a real market; it demonstrates that selection, staking,
 settlement, and accounting work end to end.
 
+### Real-market evaluation (Kalshi) — no edge
+
+The test that actually matters was run against **real Kalshi prices**: 1,010
+settled `KXLOLGAME` match markets (2026-05-09 → 2026-07-15), 700 matched to
+our games, model trained strictly on data before the window
+(`scripts/eval_vs_kalshi.py`; report in `artifacts/kalshi_eval/`, summary in
+`docs/RESULTS.md`).
+
+- **The market is sharper than the model.** Market mid log-loss 0.5497 vs
+  model 0.6119; paired diff +0.062 with 95% CI [+0.034, +0.092] — decisive.
+- **Executable-touch P&L is negative at every edge threshold** (−4% to −15%
+  ROI), and it *worsens* as the threshold rises — classic adverse selection:
+  the model's biggest "edges" are the games it's most wrong about.
+- **No closing-line value:** prices do not move toward the model (sign
+  correlation ≈ 0).
+
+Caveats: the 2026 window runs on Leaguepedia results-only features (early-game
+stats missing), and Bo1-heavy minor leagues dominate the sample. But the
+direction is unambiguous: **do not bet this model on Kalshi as-is.** The
+plumbing (ingestion, joining, fee-aware executable backtest) is the durable
+deliverable — rerun the eval after any model improvement with one command.
+
 **Honest finding — iid violation within series:** the momentum diagnostic
 (lag coefficient +0.38, sign-stable under cluster bootstrap) shows the winner
 of the previous game in a series wins the next one more often than the model's
