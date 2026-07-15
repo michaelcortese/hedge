@@ -289,6 +289,34 @@ def _betting_metrics(bets_settled: pd.DataFrame) -> dict:
     }
 
 
+def _models_dict(preds: pd.DataFrame) -> dict[str, dict]:
+    """Model-vs-baselines probability metrics table for one preds subset."""
+    y = preds["blue_win"].to_numpy(dtype=int)
+    n = len(preds)
+    models: dict[str, dict] = {"model": probability_metrics(y, preds["model_p"])}
+    if "baseline_p" in preds.columns:
+        models["baseline_elo_bt"] = probability_metrics(y, preds["baseline_p"])
+    models["const_0.5"] = probability_metrics(y, np.full(n, 0.5))
+    blue_rate = float(np.mean(y))
+    models["const_bluerate(in-sample)"] = probability_metrics(y, np.full(n, blue_rate))
+    if "fair_blue" in preds.columns:
+        models["market_fair(devig)"] = probability_metrics(y, preds["fair_blue"])
+    return models
+
+
+def _models_table_lines(models: dict[str, dict]) -> list[str]:
+    name_w = max(len(k) for k in models)
+    lines = [
+        f"{'name':<{name_w}}  {'n':>6}  {'accuracy':>8}  {'brier':>7}  {'logloss':>8}"
+    ]
+    for name, m in models.items():
+        lines.append(
+            f"{name:<{name_w}}  {m['n']:>6d}  {m['accuracy']:>8.4f}  "
+            f"{m['brier']:>7.4f}  {m['logloss']:>8.4f}"
+        )
+    return lines
+
+
 def summarize(
     preds: pd.DataFrame,
     bets_settled: pd.DataFrame | None = None,
@@ -302,6 +330,14 @@ def summarize(
     (needs ``blue_win`` + ``model_p``; scores ``baseline_p``, ``fair_blue``
     and a per-fold table when the columns are present).  Baseline rows always
     include the trivial constants 0.5 and the in-sample blue rate.
+
+    Holdout separation: when ``preds`` has an ``is_holdout`` column with any
+    True rows, all headline metrics/tables (models, logloss-diff CI, ECE,
+    reliability, momentum, per-fold, betting) are computed on the NON-holdout
+    rows only, and a separate clearly-labeled "HOLDOUT (untouched)" section
+    reports the same probability metrics (and betting restricted to holdout
+    bets, split by index membership) under the ``"holdout"`` key of the dict
+    (absent when there are no holdout rows).
 
     When ``baseline_p`` is present, the headline model-vs-baseline comparison
     gets a paired uncertainty estimate: a seeded ``n_boot``-rep bootstrap
@@ -322,18 +358,27 @@ def summarize(
     """
     if "blue_win" not in preds.columns or "model_p" not in preds.columns:
         raise ValueError("preds must have 'blue_win' and 'model_p' columns")
+
+    # ---- holdout separation ------------------------------------------------
+    # Headline numbers must never mix tuned-on folds with the untouched
+    # holdout; split preds (and bets, by index membership) up front.
+    preds_hold: pd.DataFrame | None = None
+    bets_hold: pd.DataFrame | None = None
+    if "is_holdout" in preds.columns and bool(preds["is_holdout"].any()):
+        hold_mask = preds["is_holdout"].astype(bool)
+        preds_hold = preds[hold_mask]
+        preds = preds[~hold_mask]
+        if bets_settled is not None:
+            in_hold = bets_settled.index.isin(preds_hold.index)
+            bets_hold = bets_settled.loc[in_hold]
+            bets_settled = bets_settled.loc[~in_hold]
+
     y = preds["blue_win"].to_numpy(dtype=int)
     n = len(preds)
+    blue_rate = float(np.mean(y)) if n else float("nan")
 
     # ---- model vs baselines ------------------------------------------------
-    models: dict[str, dict] = {"model": probability_metrics(y, preds["model_p"])}
-    if "baseline_p" in preds.columns:
-        models["baseline_elo_bt"] = probability_metrics(y, preds["baseline_p"])
-    models["const_0.5"] = probability_metrics(y, np.full(n, 0.5))
-    blue_rate = float(np.mean(y))
-    models["const_bluerate(in-sample)"] = probability_metrics(y, np.full(n, blue_rate))
-    if "fair_blue" in preds.columns:
-        models["market_fair(devig)"] = probability_metrics(y, preds["fair_blue"])
+    models = _models_dict(preds)
 
     # ---- paired model-vs-baseline logloss diff (bootstrap CI) --------------
     ll_diff = None
@@ -380,6 +425,22 @@ def summarize(
 
     betting = _betting_metrics(bets_settled) if bets_settled is not None and len(bets_settled) else None
 
+    # ---- holdout section (same probability metrics, untouched rows) --------
+    holdout = None
+    if preds_hold is not None:
+        y_h = preds_hold["blue_win"].to_numpy(dtype=int)
+        holdout = {
+            "n": int(len(preds_hold)),
+            "blue_rate": float(np.mean(y_h)),
+            "models": _models_dict(preds_hold),
+            "ece": ece(y_h, preds_hold["model_p"]),
+            "betting": (
+                _betting_metrics(bets_hold)
+                if bets_hold is not None and len(bets_hold)
+                else None
+            ),
+        }
+
     result = {
         "n": n,
         "models": models,
@@ -389,6 +450,8 @@ def summarize(
         "momentum": momentum,
         "betting": betting,
     }
+    if holdout is not None:
+        result["holdout"] = holdout
     if ll_diff is not None:
         result["logloss_diff_mean"] = ll_diff[0]
         result["logloss_diff_ci_lo"] = ll_diff[1]
@@ -399,17 +462,14 @@ def summarize(
     lines.append("=" * 72)
     lines.append("Walk-forward evaluation report")
     lines.append("=" * 72)
-    lines.append(f"games scored: {n}   blue win rate: {blue_rate:.4f}")
+    line = f"games scored: {n}   blue win rate: {blue_rate:.4f}"
+    if holdout is not None:
+        line += f"   (excludes {holdout['n']} holdout rows — see HOLDOUT section)"
+    lines.append(line)
     lines.append("")
 
     lines.append("-- Model vs baselines (out-of-sample) --")
-    name_w = max(len(k) for k in models)
-    lines.append(f"{'name':<{name_w}}  {'n':>6}  {'accuracy':>8}  {'brier':>7}  {'logloss':>8}")
-    for name, m in models.items():
-        lines.append(
-            f"{name:<{name_w}}  {m['n']:>6d}  {m['accuracy']:>8.4f}  "
-            f"{m['brier']:>7.4f}  {m['logloss']:>8.4f}"
-        )
+    lines.extend(_models_table_lines(models))
     if ll_diff is not None:
         mean_d, lo_d, hi_d = ll_diff
         how = "series-cluster" if "series_id" in preds.columns else "row"
@@ -473,6 +533,30 @@ def summarize(
         lines.append("")
         lines.append(f"-- Betting (flat-stake comparison arm){tag} --")
         lines.append(f"flat-stake ROI: {betting['flat_roi']:+.4f}")
+        lines.append("")
+
+    if holdout is not None:
+        lines.append("=" * 72)
+        lines.append("-- HOLDOUT (untouched) --")
+        lines.append("=" * 72)
+        lines.append(
+            f"holdout games: {holdout['n']}   "
+            f"blue win rate: {holdout['blue_rate']:.4f}"
+        )
+        lines.extend(_models_table_lines(holdout["models"]))
+        lines.append(f"ECE (holdout): {holdout['ece']:.4f}")
+        hb = holdout["betting"]
+        if hb is not None:
+            tag = f" {_SYNTHETIC_TAG}" if synthetic_odds else ""
+            lines.append(f"-- Betting on holdout rows only{tag} --")
+            lines.append(f"n_bets:         {hb['n_bets']}")
+            lines.append(f"hit_rate:       {hb['hit_rate']:.4f}")
+            lines.append(f"total_pnl:      {hb['total_pnl']:+.4f}")
+            lines.append(
+                f"ROI:            {hb['roi']:+.4f} "
+                f"(bootstrap 95% CI [{hb['roi_ci_lo']:+.4f}, {hb['roi_ci_hi']:+.4f}])"
+            )
+            lines.append(f"flat-stake ROI: {hb['flat_roi']:+.4f}")
         lines.append("")
 
     return result, "\n".join(lines)

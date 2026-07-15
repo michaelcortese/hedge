@@ -40,7 +40,7 @@ import numpy as np
 import pandas as pd
 
 from lolpred.backtest.betting import make_synthetic_odds, select_bets, settle_bets
-from lolpred.backtest.report import momentum_test, summarize
+from lolpred.backtest.report import summarize
 from lolpred.backtest.walkforward import make_folds, run_walkforward
 from lolpred.models.xgb import EloLogisticBaseline, WinModel
 
@@ -194,20 +194,9 @@ def main(argv: list[str] | None = None) -> int:
     settled = settle_bets(bets, preds["blue_win"])
 
     # ---- report ------------------------------------------------------------
-    metrics, text = summarize(preds, settled, synthetic_odds=True)
-
-    momentum = None
-    mom_cols = {"series_id", "game_in_series", "blue_team", "red_team"}
-    if mom_cols.issubset(preds.columns):
-        momentum = momentum_test(preds, seed=args.seed)
-        text += (
-            "\n-- Momentum test (within-series iid check) --\n"
-            f"lag_coef:       {momentum['lag_coef']:+.4f} "
-            "(0 under no momentum; positive = prev-game winner over-performs)\n"
-            f"sign_stability: {momentum['sign_stability']:.3f} "
-            "(~0.5 noise, ~1.0 stable effect)\n"
-            f"n lag games:    {momentum['n']}\n"
-        )
+    # summarize handles the momentum section and (when a holdout fold exists)
+    # the separate HOLDOUT section; seed keeps its bootstraps deterministic.
+    metrics, text = summarize(preds, settled, synthetic_odds=True, seed=args.seed)
 
     text += (
         "\nNOTE: synthetic odds were generated from the out-of-sample "
@@ -230,7 +219,6 @@ def main(argv: list[str] | None = None) -> int:
     metrics_json = _jsonify(
         {
             **metrics,
-            "momentum": momentum,
             "n_folds": len(folds),
             "elapsed_s": round(time.monotonic() - t0, 1),
             "args": vars(args),

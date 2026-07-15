@@ -30,7 +30,11 @@ python3 -m venv .venv
 # 4. train the final model on everything up to a cutoff
 .venv/bin/python scripts/train.py --features data/processed/features.parquet --out-dir artifacts/model
 
-# 5. price a matchup (case-insensitive team names; suggests near-misses)
+# 5. price a matchup (case-insensitive team names; suggests near-misses).
+#    With --best-of 5 the quoted odds are treated as Bo5 SERIES moneyline
+#    prices: edge and Kelly are computed from the series probability (the
+#    output says "pricing: Bo5 series moneyline"). Use --best-of 1 to price
+#    single-game odds.
 .venv/bin/python scripts/predict.py --blue T1 --red "Gen.G" --best-of 5 \
     --odds-blue 1.65 --odds-red 2.30
 ```
@@ -92,14 +96,25 @@ raw Oracle's Elixir CSVs
 
 - **Model games, not series.** One training row per game (≈3× the data of
   series-level modeling); series prices come from the exact recursion
-  `S(a,b) = p·S(a+1,b) + (1−p)·S(a,b+1)` in `lolpred/series.py`. The iid
-  assumption behind the recursion is *tested*, not assumed: the backtest runs
-  a within-series momentum regression (previous-game winner vs. next-game
+  `S(a,b) = p·S(a+1,b) + (1−p)·S(a,b+1)` in `lolpred/series.py`. Because teams
+  alternate sides across a series, `predict.py` feeds the recursion the
+  side-averaged per-game probability `p̄ = (p + (1 − p_swap))/2` (the model's
+  prediction with the two teams' orientation swapped). The iid assumption
+  behind the recursion is *tested*, not assumed: the backtest runs a
+  within-series momentum regression (previous-game winner vs. next-game
   outcome, controlling for model skill).
-- **Antisymmetry by construction.** Every team-comparative feature is a
-  blue-minus-red `_diff` that exactly negates under orientation swap; training
-  doubles the data with mirrored rows, and inference averages both
-  orientations so `P(A beats B) + P(B beats A) = 1` holds identically.
+- **Antisymmetry — with the blue-side edge preserved.** Every team-comparative
+  feature is a blue-minus-red `_diff` that exactly negates under orientation
+  swap; training doubles the data with mirrored rows carrying a ±1 perspective
+  column, and inference averages the two training representations of the SAME
+  game. The perspective column stays active at predict time because it carries
+  the real blue-side advantage (~52–53% blue win rate in pro play). A
+  consequence worth stating plainly: swapping the teams is a *different
+  physical game* (the other team now enjoys blue side), so
+  `P(A beats B) + P(B beats A) = 1` does **not** hold identically — the sum
+  exceeds 1 by (twice) the learned blue bump, and complementarity holds only
+  approximately, for side-neutral matchups. See the
+  `lolpred/models/xgb.py` module docstring.
 - **Strict-date visibility.** Features for a game may use only games from
   strictly earlier calendar days; within-day games (including Bo-series
   siblings) are mutually invisible. Enforced at a single choke point in the
@@ -109,7 +124,9 @@ raw Oracle's Elixir CSVs
   embargo gap, burn-in years never tested, optional final holdout touched
   once. No random K-fold — it leaks future ratings into the past.
 - **Calibration is the product.** The primary metric is log-loss; Platt
-  scaling is fit only on each fold's validation tail (never on test data).
+  scaling is fit only on each fold's held-out chronological tail — split into
+  an early-stopping half and a calibration half when the tail has ≥200 rows —
+  never on test data. `train.py` replicates the same tail convention.
 
 ## Evaluation & betting
 
@@ -118,7 +135,9 @@ table, and per-fold breakdowns — always against baselines that must be beaten:
 the constant 0.5, the constant blue-side rate, the Elo+BT logistic baseline,
 and the de-vigged market probability. A GBDT that cannot beat the Elo+BT
 logistic by a meaningful log-loss margin out of sample should be replaced by
-the simpler model.
+the simpler model. When a final holdout fold exists (`--holdout-start`), the
+report keeps it out of every headline number and shows it in a separate
+"HOLDOUT (untouched)" section.
 
 **All betting numbers in this repo are computed against SYNTHETIC odds — no
 historical esports odds ship with it. The synthetic bookmaker is the
@@ -193,7 +212,8 @@ artifacts/           # backtest reports + trained models (gitignored)
 
 ## License & attribution
 
-Code is MIT. The match data belongs to Oracle's Elixir and, ultimately, Riot
-Games — it is used here for personal, non-commercial analytics in line with
-Riot's data policy, and is not redistributed with this repository. If you use
-the data, credit Oracle's Elixir.
+Code is MIT (see [LICENSE](LICENSE)). The match DATA is not covered by the
+code license: it belongs to Oracle's Elixir and, ultimately, Riot Games, and
+remains subject to their terms — it is used here for personal, non-commercial
+analytics in line with Riot's data policy, and is not redistributed with this
+repository. If you use the data, credit Oracle's Elixir.

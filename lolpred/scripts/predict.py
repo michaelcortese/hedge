@@ -18,6 +18,27 @@ parquet) is available; ~a minute-plus when re-parsing raw CSVs via --raw.
 Team names are matched case-insensitively (exact) against the games table;
 on a miss, the closest names are suggested and the script exits with code 2.
 
+Side alternation and series math
+--------------------------------
+The model's ``p`` is blue-perspective and side-specific: P(--blue wins ONE
+game played with --blue on blue side). It includes the real blue-side edge
+(see lolpred/models/xgb.py), so ``p(team-swap) != 1 - p``. But teams
+alternate sides across a series, so the series recursion uses the
+side-averaged per-game probability
+
+    p_bar = (p + (1 - p_swap)) / 2
+
+where ``p_swap`` is the model's prediction for the mirrored feature row
+(the same matchup with the two teams' sides swapped: ``_diff`` columns
+negated, ``_blue``/``_red`` pairs swapped). The GAME probability output
+stays side-specific; both are labeled in the output.
+
+Betting math prices the product the odds are for: with --best-of > 1 the
+quoted --odds-blue/--odds-red are treated as SERIES moneyline prices, so
+edge and Kelly are computed from the series probability; with --best-of 1
+they are single-game prices and the game probability is used. The output
+states which product is being priced.
+
 Usage:
   .venv/bin/python scripts/predict.py --blue T1 --red "Gen.G" --best-of 5
   .venv/bin/python scripts/predict.py --blue T1 --red "Gen.G" --best-of 5 \\
@@ -127,6 +148,29 @@ def _resolve_team(name: str, games: pd.DataFrame) -> str | None:
     return None
 
 
+def _swap_orientation(X: pd.DataFrame) -> pd.DataFrame:
+    """Mirror a feature frame: the same matchup with the teams' sides swapped.
+
+    Same transform as the model's internal mirror augmentation
+    (``lolpred/models/xgb.py``): ``*_diff`` columns are negated
+    (antisymmetric), ``<stem>_blue`` / ``<stem>_red`` pairs are swapped,
+    symmetric context columns pass through unchanged.  The model API exposes
+    no public swap, so the mirrored row is rebuilt here from the same
+    feature vector.
+    """
+    Xs = X.copy()
+    diff_cols = [c for c in X.columns if c.endswith("_diff")]
+    if diff_cols:
+        Xs[diff_cols] = -Xs[diff_cols].astype(float)
+    for col_blue in X.columns:
+        if col_blue.endswith("_blue"):
+            col_red = col_blue[: -len("_blue")] + "_red"
+            if col_red in X.columns:
+                Xs[col_blue] = X[col_red].to_numpy(copy=True)
+                Xs[col_red] = X[col_blue].to_numpy(copy=True)
+    return Xs
+
+
 def _feature_row(
     games: pd.DataFrame, blue: str, red: str, date: pd.Timestamp, league: str
 ) -> pd.DataFrame:
@@ -168,6 +212,33 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     date = (pd.Timestamp(args.date) if args.date
             else pd.Timestamp.today().normalize())
+    bo = args.best_of
+
+    # Cheap argument validation before the expensive feature build.
+    score: tuple[int, int] | None = None
+    if args.score:
+        try:
+            a_str, b_str = args.score.split("-", 1)
+            a, b = int(a_str), int(b_str)
+        except ValueError:
+            print(f"--score must look like '1-1', got {args.score!r}",
+                  file=sys.stderr)
+            return 2
+        w = wins_needed(bo)
+        if a < 0 or b < 0 or a > w or b > w or (a == w and b == w):
+            print(f"--score {args.score} impossible in a best-of-{bo}",
+                  file=sys.stderr)
+            return 2
+        if a >= w or b >= w:
+            print(f"--score {args.score}: series already decided "
+                  f"(first to {w} wins a best-of-{bo}); nothing to price",
+                  file=sys.stderr)
+            return 2
+        score = (a, b)
+    if (args.odds_blue is None) != (args.odds_red is None):
+        print("provide both --odds-blue and --odds-red (or neither)",
+              file=sys.stderr)
+        return 2
 
     model_path = Path(args.model_dir) / "model.joblib"
     if not model_path.is_file():
@@ -208,6 +279,11 @@ def main(argv: list[str] | None = None) -> int:
         )
     X = row[model.feature_columns_]
     p = float(model.predict_proba(X)[0])
+    # Side-alternation correction (module docstring): p is side-specific
+    # (--blue on blue side).  Teams alternate sides across a series, so the
+    # series recursion uses the side-averaged per-game probability.
+    p_swap = float(model.predict_proba(_swap_orientation(X))[0])
+    p_bar = 0.5 * (p + (1.0 - p_swap))
 
     hist_b = float(row["f_hist_games_blue"].iloc[0])
     hist_r = float(row["f_hist_games_red"].iloc[0])
@@ -221,49 +297,46 @@ def main(argv: list[str] | None = None) -> int:
                             f"(< {MIN_HIST_GAMES}) — the backtest bet gate "
                             "would refuse this market")
 
-    bo = args.best_of
-    series_p = series_win_prob(p, bo)
+    # Series math uses the side-averaged probability (teams alternate sides).
+    series_p = series_win_prob(p_bar, bo)
     score_state = None
-    if args.score:
-        try:
-            a_str, b_str = args.score.split("-", 1)
-            a, b = int(a_str), int(b_str)
-        except ValueError:
-            print(f"--score must look like '1-1', got {args.score!r}",
-                  file=sys.stderr)
-            return 2
-        w = wins_needed(bo)
-        if not (0 <= a <= w and 0 <= b <= w) or (a == w and b == w):
-            print(f"--score {args.score} impossible in a best-of-{bo}",
-                  file=sys.stderr)
-            return 2
+    if score is not None:
+        a, b = score
         score_state = {
             "score": f"{a}-{b}",
-            "series_p_blue": series_win_prob(p, bo, a, b),
+            "series_p_blue": series_win_prob(p_bar, bo, a, b),
         }
-    scores = {f"{k[0]}-{k[1]}": v for k, v in exact_score_probs(p, bo).items()}
+    scores = {f"{k[0]}-{k[1]}": v for k, v in exact_score_probs(p_bar, bo).items()}
 
     betting = None
-    if (args.odds_blue is None) != (args.odds_red is None):
-        print("provide both --odds-blue and --odds-red (or neither)",
-              file=sys.stderr)
-        return 2
     if args.odds_blue is not None:
+        # Price the product the odds are for: with --best-of > 1 the quoted
+        # odds are SERIES moneyline prices, so edge/Kelly come from the
+        # series probability; with --best-of 1 from the game probability.
+        if bo > 1:
+            pricing = f"Bo{bo} series moneyline"
+            priced_p = series_p
+        else:
+            pricing = "single game (Bo1) moneyline"
+            priced_p = p
         imp_b, imp_r = 1.0 / args.odds_blue, 1.0 / args.odds_red
         fair_b, fair_r = devig_proportional(imp_b, imp_r)
         betting = {
+            "pricing": pricing,
+            "priced_p_blue": priced_p,
             "odds_blue": args.odds_blue,
             "odds_red": args.odds_red,
             "implied_blue": imp_b,
             "implied_red": imp_r,
             "fair_blue": fair_b,
             "fair_red": fair_r,
-            "edge_blue": p - imp_b,      # vs vigged price (what you pay)
-            "edge_red": (1.0 - p) - imp_r,
+            "edge_blue": priced_p - imp_b,      # vs vigged price (what you pay)
+            "edge_red": (1.0 - priced_p) - imp_r,
             "kelly_mult": args.kelly_mult,
-            "stake_frac_blue": args.kelly_mult * kelly_fraction(p, args.odds_blue),
+            "stake_frac_blue": args.kelly_mult
+            * kelly_fraction(priced_p, args.odds_blue),
             "stake_frac_red": args.kelly_mult
-            * kelly_fraction(1.0 - p, args.odds_red),
+            * kelly_fraction(1.0 - priced_p, args.odds_red),
         }
 
     result = {
@@ -272,8 +345,9 @@ def main(argv: list[str] | None = None) -> int:
         "date": str(date.date()),
         "league": league,
         "best_of": bo,
-        "p_blue": p,
+        "p_blue": p,                      # game prob, --blue ON BLUE SIDE
         "p_red": 1.0 - p,
+        "p_blue_side_avg": p_bar,         # side-averaged; feeds the series math
         "fair_odds_blue": 1.0 / p,
         "fair_odds_red": 1.0 / (1.0 - p),
         "series_p_blue": series_p,
@@ -293,9 +367,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n{blue} (blue) vs {red} (red)  —  {league}, {date.date()}, "
           f"best-of-{bo}")
     print("-" * 64)
-    print(f"game win prob:    {blue}: {p:.3f}   {red}: {1 - p:.3f}")
+    print(f"game ({blue} on blue side):    {blue}: {p:.3f}   "
+          f"{red}: {1 - p:.3f}")
     print(f"fair decimal odds: {blue}: {1 / p:.2f}   {red}: {1 / (1 - p):.2f}")
     if bo > 1:
+        print(f"per-game side-averaged (used for series): {blue}: {p_bar:.3f}"
+              f"   {red}: {1 - p_bar:.3f}")
         print(f"series win prob:  {blue}: {series_p:.3f}   "
               f"{red}: {1 - series_p:.3f}")
     if score_state:
@@ -310,6 +387,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nvs offered odds (blue {betting['odds_blue']:.2f} / "
               f"red {betting['odds_red']:.2f}, "
               f"book {betting['implied_blue'] + betting['implied_red']:.3f}):")
+        print(f"  pricing: {betting['pricing']} "
+              f"(model p_blue {betting['priced_p_blue']:.3f})")
         print(f"  implied (vigged): blue {betting['implied_blue']:.3f}  "
               f"red {betting['implied_red']:.3f}")
         print(f"  fair (de-vigged): blue {betting['fair_blue']:.3f}  "

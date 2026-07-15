@@ -195,21 +195,23 @@ def make_settled_bets(n=30, seed=6) -> pd.DataFrame:
 
 class TestSummarize:
     def test_dict_keys_and_sections(self):
-        preds = make_preds()
-        bets = make_settled_bets()
+        preds = make_preds()  # last fold (100 rows) flagged is_holdout
+        bets = make_settled_bets()  # index 0..29 -> all non-holdout rows
         result, text = summarize(preds, bets_settled=bets, synthetic_odds=True)
 
         assert set(result) == {
             "n", "models", "per_fold", "ece", "reliability", "momentum",
-            "betting", "logloss_diff_mean", "logloss_diff_ci_lo",
+            "betting", "holdout", "logloss_diff_mean", "logloss_diff_ci_lo",
             "logloss_diff_ci_hi",
         }
-        assert result["n"] == len(preds)
+        # headline n excludes the holdout rows
+        n_hold = int(preds["is_holdout"].sum())
+        assert result["n"] == len(preds) - n_hold
         for name in ("model", "baseline_elo_bt", "const_0.5",
                      "const_bluerate(in-sample)", "market_fair(devig)"):
             assert name in result["models"]
             assert set(result["models"][name]) == {"accuracy", "brier", "logloss", "n"}
-        assert len(result["per_fold"]) == 4
+        assert len(result["per_fold"]) == 3  # holdout fold not in headline table
         assert np.isfinite(result["ece"])
 
         b = result["betting"]
@@ -292,6 +294,36 @@ class TestSummarize:
         assert result["betting"] is None
         assert "Betting" not in text
         assert "SYNTHETIC ODDS" not in text
+
+    def test_holdout_separation(self):
+        preds = make_preds()  # rows 300..399 are holdout
+        n_hold = int(preds["is_holdout"].sum())
+        assert n_hold == 100
+        # bets straddle the dev/holdout boundary: index 290..309
+        bets = make_settled_bets(n=20)
+        bets.index = pd.RangeIndex(290, 310)
+        result, text = summarize(preds, bets_settled=bets)
+
+        assert "holdout" in result
+        hold = result["holdout"]
+        assert hold["n"] == n_hold
+        assert result["n"] == len(preds) - n_hold
+        # same probability metrics, computed on the holdout rows only
+        assert set(hold["models"]["model"]) == {"accuracy", "brier", "logloss", "n"}
+        assert hold["models"]["model"]["n"] == n_hold
+        assert np.isfinite(hold["ece"])
+        # bets split by index membership in the holdout rows
+        assert result["betting"]["n_bets"] == 10
+        assert hold["betting"]["n_bets"] == 10
+        assert "HOLDOUT (untouched)" in text
+
+    def test_no_holdout_rows_no_holdout_key(self):
+        preds = make_preds()
+        preds["is_holdout"] = False  # column present but no holdout rows
+        result, text = summarize(preds)
+        assert "holdout" not in result
+        assert result["n"] == len(preds)
+        assert "HOLDOUT" not in text
 
     def test_minimal_preds_columns(self):
         rng = np.random.default_rng(9)

@@ -20,8 +20,10 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from lolpred.backtest.betting import kelly_fraction
 from lolpred.data.synthetic import generate_synthetic_games
 from lolpred.features.build import build_matchup_features
+from lolpred.series import series_win_prob
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO / "scripts"
@@ -126,11 +128,17 @@ def test_train_writes_artifacts(data_dir, model_dir):
     assert (model_dir / "model.joblib").is_file()
     meta = json.loads((model_dir / "training_meta.json").read_text())
     assert meta["n_games"] > 0
-    assert meta["n_fit"] + meta["n_val"] == meta["n_games"]
+    assert meta["n_fit"] + meta["n_val"] + meta["n_cal"] == meta["n_games"]
+    # fixture is large enough (tail >= 200) to trigger the walkforward-style
+    # val/cal split: tail halves differ by at most one row
+    assert meta["n_val"] >= 2 and meta["n_cal"] >= 2
+    assert abs(meta["n_val"] - meta["n_cal"]) <= 1
     assert isinstance(meta["feature_columns"], list) and meta["feature_columns"]
     assert all(c.startswith("f_") for c in meta["feature_columns"])
     assert isinstance(meta["calibrated"], bool)
     assert meta["val_logloss"] is None or 0.0 < meta["val_logloss"] < 2.0
+    assert meta["cal_logloss"] is None or 0.0 < meta["cal_logloss"] < 2.0
+    assert meta["n_cal"] == 0 or meta["cal_logloss"] is not None
     assert meta["train_end"] >= "2020-09-01"  # default cutoff = max date
 
     # the saved model round-trips and honors the feature contract
@@ -166,19 +174,30 @@ def test_predict_json_fast_path(data_dir, model_dir):
     assert 0.0 < p < 1.0
     assert result["p_red"] == pytest.approx(1.0 - p)
 
-    # series prob consistent with the game prob (same favorite for Bo5)
+    # series math runs on the side-averaged per-game probability
+    p_bar = result["p_blue_side_avg"]
+    assert 0.0 < p_bar < 1.0
     s = result["series_p_blue"]
     assert 0.0 < s < 1.0
-    assert (p - 0.5) * (s - 0.5) >= 0.0
-    # Bo5 amplifies the favorite
-    assert abs(s - 0.5) >= abs(p - 0.5) - 1e-12
+    assert (p_bar - 0.5) * (s - 0.5) >= 0.0  # same favorite
+    # Bo5 amplifies the favorite (relative to the side-averaged game prob)
+    assert abs(s - 0.5) >= abs(p_bar - 0.5) - 1e-12
+    assert s == pytest.approx(series_win_prob(p_bar, 5))
 
     assert sum(result["exact_score_probs"].values()) == pytest.approx(1.0)
     assert result["fair_odds_blue"] == pytest.approx(1.0 / p)
     assert 0.0 <= result["series_from_score"]["series_p_blue"] <= 1.0
 
+    # --best-of 5 with odds: the SERIES probability is priced, not the game p
     bet = result["betting"]
-    assert bet["edge_blue"] == pytest.approx(p - 1.0 / 1.8)
+    assert bet["pricing"] == "Bo5 series moneyline"
+    assert bet["priced_p_blue"] == pytest.approx(s)
+    assert bet["edge_blue"] == pytest.approx(s - 1.0 / 1.8)
+    assert bet["edge_red"] == pytest.approx((1.0 - s) - 1.0 / 2.1)
+    assert bet["stake_frac_blue"] == pytest.approx(0.25 * kelly_fraction(s, 1.8))
+    assert bet["stake_frac_red"] == pytest.approx(
+        0.25 * kelly_fraction(1.0 - s, 2.1)
+    )
     assert bet["stake_frac_blue"] >= 0.0 and bet["stake_frac_red"] >= 0.0
     # both teams have long synthetic histories -> no cold-start warnings
     assert result["hist_games_blue"] >= 10
@@ -196,9 +215,42 @@ def test_predict_features_flag_human_output(data_dir, model_dir):
         "--features", data_dir / "features.parquet",  # sibling games.parquet
         "--model-dir", model_dir,
     )
-    assert "game win prob" in proc.stdout
+    assert f"game ({team_a} on blue side)" in proc.stdout
     assert "series win prob" in proc.stdout
     assert team_a in proc.stdout and team_b in proc.stdout
+
+
+def test_predict_rejects_decided_score():
+    # 3-1 in a Bo5 is already decided -> clear error, nonzero exit; the
+    # check runs before any data/model loading, so no fixtures are needed.
+    proc = run_script(
+        "predict.py",
+        "--blue", "A",
+        "--red", "B",
+        "--best-of", 5,
+        "--score", "3-1",
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "already decided" in proc.stderr
+
+
+def test_predict_human_output_labels_pricing(data_dir, model_dir):
+    team_a, team_b = _two_teams(data_dir)
+    proc = run_script(
+        "predict.py",
+        "--blue", team_a,
+        "--red", team_b,
+        "--best-of", 5,
+        "--date", PREDICT_DATE,
+        "--games-cache", data_dir / "games.parquet",
+        "--model-dir", model_dir,
+        "--odds-blue", 1.8,
+        "--odds-red", 2.1,
+    )
+    assert "pricing: Bo5 series moneyline" in proc.stdout
+    assert "per-game side-averaged (used for series)" in proc.stdout
+    assert "on blue side" in proc.stdout
 
 
 def test_predict_unknown_team_exits_2(data_dir, model_dir):

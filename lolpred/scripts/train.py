@@ -2,14 +2,20 @@
 """Train the final WinModel on all data up to a cutoff and save artifacts.
 
 The chronologically LAST ``--calib-frac`` of the training window is held out
-as a validation slice for early stopping and Platt calibration (the same
-scheme run_walkforward uses per fold); everything before it is fit data.
+as a tail, exactly the scheme run_walkforward uses per fold: when the tail
+has at least ``_MIN_TAIL_FOR_CAL_SPLIT`` (200) rows it is split
+chronologically in half — the FIRST half is the early-stopping validation
+set, the SECOND (most recent) half is the Platt calibration slice
+(``X_cal``/``y_cal``) — so the calibrator is not fit on the same rows the
+stopping point was chosen on.  Smaller tails do double duty as the val set
+(no separate cal slice); everything before the tail is fit data.
 
 Artifacts written to --out-dir:
   * ``model.joblib``       — the fitted WinModel (via WinModel.save)
   * ``training_meta.json`` — cutoff, row counts, feature columns,
-                             best_iteration, calibrated flag, validation
-                             logloss
+                             best_iteration, calibrated flag, val logloss
+                             (early-stop half only) + cal logloss (when a
+                             calibration slice exists)
 
 Note: no rolling feature state is persisted. scripts/predict.py recomputes
 features from the canonical games table at prediction time (fast with the
@@ -34,6 +40,7 @@ from pathlib import Path
 import pandas as pd
 
 from lolpred.backtest.report import probability_metrics
+from lolpred.backtest.walkforward import _MIN_TAIL_FOR_CAL_SPLIT
 from lolpred.models.xgb import PERSP_COL, WinModel
 
 
@@ -80,25 +87,42 @@ def main(argv: list[str] | None = None) -> int:
     X = feats[feature_cols].reset_index(drop=True)
     y = feats["blue_win"].to_numpy(dtype=int)
 
+    # Tail convention (identical to run_walkforward): chronologically last
+    # calib_frac of rows; tails >= _MIN_TAIL_FOR_CAL_SPLIT are split in half
+    # into early-stopping val (first) / Platt calibration (second, most
+    # recent); smaller tails do double duty as the val set.
     n = len(X)
-    n_val = min(int(round(args.calib_frac * n)), n - 1)
-    if n_val >= 2:
-        X_fit, y_fit = X.iloc[:-n_val], y[:-n_val]
-        X_val, y_val = X.iloc[-n_val:], y[-n_val:]
+    n_tail = min(int(round(args.calib_frac * n)), n - 1)
+    X_val = y_val = X_cal = y_cal = None
+    if n_tail >= 2:
+        X_fit, y_fit = X.iloc[:-n_tail], y[:-n_tail]
+        X_tail, y_tail = X.iloc[-n_tail:], y[-n_tail:]
+        if n_tail >= _MIN_TAIL_FOR_CAL_SPLIT:
+            half = n_tail // 2
+            X_val, y_val = X_tail.iloc[:half], y_tail[:half]
+            X_cal, y_cal = X_tail.iloc[half:], y_tail[half:]
+        else:
+            X_val, y_val = X_tail, y_tail
     else:
-        X_fit, y_fit, X_val, y_val = X, y, None, None
+        X_fit, y_fit = X, y
     print(f"training on {len(X_fit)} games "
-          f"(validation tail: {0 if X_val is None else len(X_val)}) "
+          f"(val tail: {0 if X_val is None else len(X_val)}, "
+          f"cal tail: {0 if X_cal is None else len(X_cal)}) "
           f"through {train_end.date()}")
 
     model_params = json.loads(args.model_params) if args.model_params else None
     model = WinModel(params=model_params, seed=args.seed)
-    model.fit(X_fit, y_fit, X_val, y_val)
+    model.fit(X_fit, y_fit, X_val, y_val, X_cal=X_cal, y_cal=y_cal)
 
-    val_logloss = None
+    val_logloss = None  # on the early-stop half only
     if X_val is not None:
         val_logloss = probability_metrics(
             y_val, model.predict_proba(X_val)
+        )["logloss"]
+    cal_logloss = None  # on the calibration half, when present
+    if X_cal is not None:
+        cal_logloss = probability_metrics(
+            y_cal, model.predict_proba(X_cal)
         )["logloss"]
 
     out_dir = Path(args.out_dir)
@@ -112,10 +136,12 @@ def main(argv: list[str] | None = None) -> int:
         "n_games": int(n),
         "n_fit": int(len(X_fit)),
         "n_val": 0 if X_val is None else int(len(X_val)),
+        "n_cal": 0 if X_cal is None else int(len(X_cal)),
         "feature_columns": feature_cols,
         "best_iteration": int(best_it) if best_it is not None else None,
         "calibrated": bool(model.calibrated_),
         "val_logloss": val_logloss,
+        "cal_logloss": cal_logloss,
         "seed": args.seed,
         "model_params": model_params,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -127,7 +153,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"saved {out_dir / 'training_meta.json'}")
     print(f"best_iteration: {meta['best_iteration']}  "
           f"calibrated: {meta['calibrated']}  "
-          f"val logloss: {val_logloss if val_logloss is None else round(val_logloss, 4)}")
+          f"val logloss: {val_logloss if val_logloss is None else round(val_logloss, 4)}  "
+          f"cal logloss: {cal_logloss if cal_logloss is None else round(cal_logloss, 4)}")
     print(f"elapsed: {time.monotonic() - t0:.1f}s")
     print("note: predict.py rebuilds features from the games table at "
           "prediction time — keep data/raw (or the games.parquet cache) "
