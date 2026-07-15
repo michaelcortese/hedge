@@ -529,7 +529,13 @@ def summarize(
             f"(bootstrap 95% CI [{betting['roi_ci_lo']:+.4f}, {betting['roi_ci_hi']:+.4f}])"
         )
         lines.append(f"max_drawdown:   {betting['max_drawdown']:.4f}")
-        lines.append(f"final_bankroll: {betting['final_bankroll']:.4f} (start 1.0)")
+        fb = betting["final_bankroll"]
+        fb_str = f"{fb:.4f}" if fb < 1e6 else f"{fb:.3e}"
+        lines.append(
+            f"final_bankroll: {fb_str} (start 1.0; compounding {betting['n_bets']} "
+            "sequential bets — astronomically large values just mean the synthetic "
+            "book is beatable by construction, see note below)"
+        )
         lines.append("")
         lines.append(f"-- Betting (flat-stake comparison arm){tag} --")
         lines.append(f"flat-stake ROI: {betting['flat_roi']:+.4f}")

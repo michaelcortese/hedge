@@ -156,18 +156,48 @@ canary.
 
 ## Results
 
-<!-- TODO(orchestrator): fill from a scripts/backtest.py run on real data.
-     Paste artifacts/backtest/report.txt highlights here: games scored,
-     model vs baseline log-loss table, ECE, and the SYNTHETIC-odds betting
-     block with its disclaimer. -->
+Walk-forward backtest over the full corpus (90,827 pro games, 2014–2025;
+burn-in through 2018; twelve 6-month folds 2019–2024; **2025 reserved as an
+untouched holdout**). Full report: `docs/RESULTS.md` (regenerate with
+`scripts/backtest.py --holdout-start 2025-01-01`).
 
-*Pending — this section is filled from a `scripts/backtest.py` run over the
-full historical dataset.*
+**Probability quality, out-of-sample 2019–2024 (62,375 games):**
+
+| model | accuracy | Brier | log-loss |
+|---|---|---|---|
+| XGBoost (this repo) | **0.6293** | **0.2235** | **0.6371** |
+| Elo+BT logistic baseline | 0.6242 | 0.2255 | 0.6416 |
+| constant blue rate | 0.5289 | 0.2492 | 0.6915 |
+| synthetic de-vigged market | 0.6027 | 0.2340 | 0.6602 |
+
+Paired log-loss difference (model − baseline): **−0.0045**, 95%
+series-cluster-bootstrap CI **[−0.0055, −0.0035]** — the model's edge over the
+rating-only baseline is small but decisively nonzero, and it held in **every
+one of the 12 folds**. Calibration ECE 0.0064 over 10 equal-count bins.
+
+**Untouched 2025 holdout (9,423 games, touched once):** accuracy 0.6309,
+log-loss 0.6342 vs baseline 0.6389, ECE 0.0121 — the edge generalizes forward
+in time.
+
+**Betting simulation (SYNTHETIC odds — plumbing validation only, see above):**
+26k bets selected at ≥5¢ edge, hit rate 0.537, ROI ≈ +29% with tight CI.
+Against a synthetic book this is *by construction* beatable and says nothing
+about beating a real market; it demonstrates that selection, staking,
+settlement, and accounting work end to end.
+
+**Honest finding — iid violation within series:** the momentum diagnostic
+(lag coefficient +0.38, sign-stable under cluster bootstrap) shows the winner
+of the previous game in a series wins the next one more often than the model's
+probability implies. This is momentum *or* model misspecification (the
+regression only de-confounds if the model were perfect); either way, series
+prices computed from the iid recursion are slightly too kind to underdogs in
+`predict.py`, and this is the first thing v2 should model.
 
 ## Limitations & roadmap
 
-- **2024 data gap** until the Google Drive quota clears for that year's file
-  (2014–2023 and 2025 download reliably from the other sources).
+- **2026 (current season) data** needs the Google Drive quota to clear
+  (`scripts/download_data.py --source gdrive --years 2026`); 2014–2025 download
+  reliably from the HF/Kaggle/GitHub mirrors wired into the script.
 - **No real historical odds.** Everything in the betting section is synthetic
   (see above). Acquiring real closing lines is the single highest-value next
   step — it is the only way to measure actual edge.
