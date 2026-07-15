@@ -14,11 +14,28 @@ voids the campaign):
   bets inside an event are not independent. Resampling whole events is the
   unit of independence; a naive per-bet bootstrap understates variance and
   overstates significance whenever a rule fires several times per event.
-* **One-sided bootstrap p-value.** ``H0: E[pnl per bet] <= 0``. The p-value is
-  the fraction of cluster-bootstrap replicates with total pnl <= 0, with the
-  standard ``(1 + hits) / (1 + n_boot)`` correction so p is never exactly 0.
-  This is the percentile-CI-inversion approximation; it is honest as long as
-  the number of event clusters is not tiny (hence the ``MIN_EVENTS`` gate).
+* **One-sided bootstrap p-value.** ``H0: E[pnl per bet] <= 0``. The bootstrap
+  p (``p_boot``) is the fraction of cluster-bootstrap replicates with total
+  pnl <= 0, with the standard ``(1 + hits) / (1 + n_boot)`` correction so p is
+  never exactly 0. This is the percentile-CI-inversion approximation; it is
+  honest as long as the number of event clusters is not tiny (hence the
+  ``MIN_EVENTS`` gate).
+* **Exact boundary guard (degenerate-bootstrap fix).** When every bet wins
+  (or every bet loses) all bootstrap replicates share one sign, so ``p_boot``
+  pins at its resolution floor ``1/(n_boot + 1)`` — an artifact of ``n_boot``,
+  not evidence. The guard is an exact test under the least-favorable null on
+  the H0 boundary (every bet's EV exactly 0): a claim bought at all-in cost
+  ``c = entry_price + fee`` (payoff $1 on a win) wins with probability
+  exactly ``c``. Within-cluster dependence is handled conservatively by
+  treating each event cluster as ONE Bernoulli whose win probability is the
+  MAXIMUM cost inside the cluster (perfect within-cluster dependence — a
+  cluster of correlated bets wins together at most as often as its safest
+  bet). The test statistic is the number of clusters whose bets ALL won;
+  ``p_exact = P(#cluster-wins >= observed)`` under the Poisson-binomial over
+  the cluster win probs (for an all-win sample this reduces to the product
+  over clusters of the max cost, :func:`exact_allwin_p`). The reported
+  ``p_value = max(p_boot, p_exact)`` — the exact tail acts as a general
+  conservative guard, and for degenerate samples it replaces the floor.
 * **Bonferroni across everything tried.** ``p_adj = p * n_families_tested *
   n_variants_in_family`` (capped at 1). Bonferroni is conservative but it is
   the only correction that survives "we do not know how correlated the
@@ -29,8 +46,14 @@ Verdict (frozen):
 
 * ``INSUFFICIENT_N``  — fewer than ``MIN_BETS`` (30) bets or fewer than
   ``MIN_EVENTS`` (20) distinct event clusters. No claim either way.
-* ``SIGNIFICANT``     — n gates pass AND ``p_adj < 0.05`` AND the cluster-
-  bootstrap **99%** CI lower bound on ROI is > 0.
+* ``SIGNIFICANT``     — n gates pass AND ``p_adj < 0.05`` (Bonferroni on the
+  honest ``p_value = max(p_boot, p_exact)``) AND the cluster-bootstrap **99%**
+  CI lower bound on ROI is > 0 AND, when the bootstrap is degenerate (all
+  outcomes one sign, so its CIs are conditional on having seen zero losses),
+  the all-win sample additionally survives a 99% flip-rate haircut: with zero
+  observed cluster losses in ``k`` clusters, the one-sided 99% upper bound on
+  the per-cluster flip rate is ``1 - 0.01**(1/k)``, and
+  :func:`flip_haircut_ev` at that rate must stay > 0.
 * ``NOT_SIGNIFICANT`` — everything else.
 
 P&L convention (matches ``kalshi_eval``): a bet costs ``(entry_price + fee) *
@@ -51,6 +74,9 @@ __all__ = [
     "MIN_EVENTS",
     "ALPHA",
     "evaluate_frozen_rule",
+    "exact_allwin_p",
+    "flip_haircut_ev",
+    "poisson_binomial_tail",
     "minimum_detectable_edge",
     "kelly_capped_stakes",
     "summarize_families",
@@ -87,6 +113,91 @@ def _validate_bets(bets: pd.DataFrame) -> None:
         raise ValueError("stake must be > 0 contracts")
 
 
+# ------------------------------------------------- exact boundary-null tools
+
+
+def poisson_binomial_tail(probs, k_min: int) -> float:
+    """Upper tail ``P(W >= k_min)`` for ``W = sum of independent Bernoulli(probs)``.
+
+    Exact, via the standard O(n^2) convolution DP over the per-trial success
+    probabilities. ``k_min <= 0`` returns 1.0; ``k_min > len(probs)`` returns
+    0.0. Used for the exact clustered boundary-null test in
+    :func:`evaluate_frozen_rule` (one Bernoulli per event cluster).
+    """
+    probs = np.asarray(probs, dtype=float)
+    if probs.ndim != 1 or len(probs) == 0:
+        raise ValueError("probs must be a non-empty 1-D array")
+    if not np.all((probs >= 0.0) & (probs <= 1.0)):
+        raise ValueError("probs must be in [0, 1]")
+    k_min = int(k_min)
+    if k_min <= 0:
+        return 1.0
+    if k_min > len(probs):
+        return 0.0
+    pmf = np.array([1.0])
+    for q in probs:
+        pmf = np.convolve(pmf, [1.0 - q, q])
+    return float(min(1.0, pmf[k_min:].sum()))
+
+
+def _cluster_max_costs(costs: np.ndarray, clusters: np.ndarray) -> np.ndarray:
+    """Per-cluster boundary-null win prob: max all-in cost within the cluster,
+    clipped to 1 (perfect within-cluster dependence — the conservative choice)."""
+    costs = np.asarray(costs, dtype=float)
+    clusters = np.asarray(clusters)
+    if costs.ndim != 1 or clusters.ndim != 1 or len(costs) != len(clusters):
+        raise ValueError("costs and clusters must be 1-D arrays of equal length")
+    if len(costs) == 0:
+        raise ValueError("costs is empty")
+    if not np.all(costs > 0.0):
+        raise ValueError("costs must be > 0")
+    codes, uniques = pd.factorize(clusters)
+    q = np.zeros(len(uniques))
+    np.maximum.at(q, codes, np.minimum(costs, 1.0))
+    return q
+
+
+def exact_allwin_p(costs, clusters) -> float:
+    """Exact one-sided p for an ALL-WIN sample under the boundary null.
+
+    For bets bought at all-in cost ``c_i`` (entry + fee, payoff $1 on a win),
+    the least-favorable null on the ``H0: EV <= 0`` boundary has each bet win
+    with probability exactly ``c_i``. Within-cluster dependence is handled
+    conservatively by treating each cluster as ONE Bernoulli whose win
+    probability is the MAXIMUM cost within the cluster:
+
+        p_exact = prod over clusters of max(c_i in cluster)
+
+    ``costs`` and ``clusters`` are aligned 1-D arrays (one entry per bet).
+    """
+    return float(np.prod(_cluster_max_costs(costs, clusters)))
+
+
+def flip_haircut_ev(costs, clusters, flip_rate_ub: float) -> float:
+    """Mean pnl per bet (per contract) of an all-win book under a flip haircut.
+
+    Each event cluster of an all-win sample independently "flips" to a total
+    loss with probability ``flip_rate_ub`` (an upper bound on the unseen
+    cluster loss rate); a flipped bet's pnl is ``-cost`` instead of
+    ``1 - cost``. By linearity the expectation is cluster-invariant:
+
+        E[pnl per bet] = mean(1 - costs) - flip_rate_ub
+
+    (clusters only affect the variance, not the mean; the argument is kept
+    for shape validation and API symmetry with :func:`exact_allwin_p`).
+    Assumes flat one-contract stakes.
+    """
+    costs = np.asarray(costs, dtype=float)
+    clusters = np.asarray(clusters)
+    if costs.ndim != 1 or clusters.ndim != 1 or len(costs) != len(clusters):
+        raise ValueError("costs and clusters must be 1-D arrays of equal length")
+    if len(costs) == 0:
+        raise ValueError("costs is empty")
+    if not (0.0 <= float(flip_rate_ub) <= 1.0):
+        raise ValueError("flip_rate_ub must be in [0, 1]")
+    return float(np.mean(1.0 - costs) - float(flip_rate_ub))
+
+
 # ------------------------------------------------------------ the main gate
 
 
@@ -121,13 +232,48 @@ def evaluate_frozen_rule(
     -------
     dict with keys: ``n``, ``n_events``, ``staked``, ``pnl``, ``roi``,
     ``mean_pnl_per_bet``, ``roi_ci95`` / ``roi_ci99`` /
-    ``mean_pnl_ci95`` / ``mean_pnl_ci99`` (each ``(lo, hi)``), ``p_value``,
-    ``n_tests``, ``p_adj``, ``verdict``, ``es5_pnl`` (expected shortfall:
-    mean total pnl over the worst 5% of bootstrap replicates — the "unlucky
-    rerun" loss), ``max_drawdown`` (realized peak-to-trough of cumulative pnl
-    in row order, >= 0), ``break_even_extra_cost_per_bet`` (dollars of extra
-    per-bet cost — slippage, adverse fills, fee underestimate — that would
-    zero the total pnl; 0 if pnl is already <= 0), ``seed``, ``n_boot``.
+    ``mean_pnl_ci95`` / ``mean_pnl_ci99`` (each ``(lo, hi)``), ``p_boot``,
+    ``p_exact``, ``p_value``, ``degenerate_boot``,
+    ``ci_conditional_on_no_loss``, ``flip_rate_ub99``,
+    ``flip_haircut_mean_pnl``, ``n_tests``, ``p_adj``, ``verdict``,
+    ``es5_pnl`` (expected shortfall: mean total pnl over the worst 5% of
+    bootstrap replicates — the "unlucky rerun" loss), ``max_drawdown``
+    (realized peak-to-trough of cumulative pnl in row order, >= 0),
+    ``break_even_extra_cost_per_bet`` (dollars of extra per-bet cost —
+    slippage, adverse fills, fee underestimate — that would zero the total
+    pnl; 0 if pnl is already <= 0), ``seed``, ``n_boot``.
+
+    The p-values, precisely:
+
+    * ``p_boot`` — one-sided cluster-bootstrap p for ``H0: E[pnl] <= 0``:
+      ``(1 + #{replicates with total pnl <= 0}) / (1 + n_boot)``. When every
+      outcome shares one sign the bootstrap is degenerate and this pins at
+      the resolution floor ``1/(n_boot + 1)`` (all wins) or at ~1 (all
+      losses) — an artifact of ``n_boot``, not evidence.
+    * ``p_exact`` — exact test under the least-favorable boundary null
+      (every bet's EV exactly 0, so a bet at all-in per-contract cost
+      ``c = entry_price + fee`` wins with probability ``c``, stake-invariant).
+      Each event cluster is treated as ONE Bernoulli with win probability
+      ``min(1, max cost in cluster)`` (perfect within-cluster dependence —
+      conservative). The statistic is the number of clusters whose bets ALL
+      won; ``p_exact = P(#cluster-wins >= observed)`` under the
+      Poisson-binomial over the cluster win probs. For an all-win sample
+      this is exactly :func:`exact_allwin_p` (the product of cluster max
+      costs).
+    * ``p_value = max(p_boot, p_exact)`` — the honest, reported p; ``p_adj``
+      is the Bonferroni adjustment of it.
+
+    ``degenerate_boot`` is True when all pnl outcomes share one sign.
+    ``ci_conditional_on_no_loss`` is True when every bet won: the bootstrap
+    can then only resample wins, so ALL reported CIs (and ``es5_pnl``) are
+    conditional on having observed zero losses — they say nothing about loss
+    risk. For that case the verdict's ROI-CI99 gate must additionally be
+    satisfied by a 99% flip-rate haircut: with zero observed cluster losses
+    in ``k`` clusters, the one-sided 99% upper bound on the per-cluster flip
+    rate is ``flip_rate_ub99 = 1 - 0.01**(1/k)``, and
+    ``flip_haircut_mean_pnl = flip_haircut_ev(cost, clusters,
+    flip_rate_ub99)`` must be > 0 for ``SIGNIFICANT``. Both keys are ``None``
+    unless the sample is all-win.
     """
     _validate_bets(bets)
     if n_families_tested < 1 or n_variants_in_family < 1:
@@ -179,9 +325,41 @@ def evaluate_frozen_rule(
     mean_ci99 = _ci(b_mean, 0.99)
 
     # One-sided p for H0: pnl <= 0, via the bootstrap distribution.
-    p_value = float((1 + int(np.sum(b_pnl <= 0.0))) / (1 + n_boot))
+    p_boot = float((1 + int(np.sum(b_pnl <= 0.0))) / (1 + n_boot))
+
+    # Exact clustered boundary-null tail (see docstring): each cluster is one
+    # Bernoulli winning w.p. min(1, max per-contract cost in cluster); the
+    # statistic is the number of clusters whose bets ALL won.
+    cost_pc = entry + fee  # per-contract all-in cost = boundary-null win prob
+    q_cluster = np.zeros(k)
+    np.maximum.at(q_cluster, codes, np.minimum(cost_pc, 1.0))
+    cl_all_won = np.ones(k, dtype=bool)
+    np.logical_and.at(cl_all_won, codes, won)
+    p_exact = poisson_binomial_tail(q_cluster, int(cl_all_won.sum()))
+
+    # Honest p: the exact tail guards the bootstrap; when the bootstrap is
+    # degenerate (one sign only) it replaces the 1/(n_boot+1) floor.
+    p_value = float(max(p_boot, p_exact))
+    degenerate_boot = bool(np.all(pnl > 0.0) or np.all(pnl <= 0.0))
+    all_win = bool(won.all())
+
     n_tests = int(n_families_tested) * int(n_variants_in_family)
     p_adj = float(min(1.0, p_value * n_tests))
+
+    # All-win bootstrap CIs are conditional on zero losses; the ROI-CI99 gate
+    # must then also survive a 99% flip-rate haircut (0 cluster losses in k
+    # clusters -> one-sided 99% UB on the per-cluster flip rate).
+    if all_win:
+        flip_rate_ub99 = float(1.0 - 0.01 ** (1.0 / k))
+        flip_haircut_mean_pnl = flip_haircut_ev(
+            cost_pc, bets["event_ticker"].to_numpy(), flip_rate_ub99
+        )
+    else:
+        flip_rate_ub99 = None
+        flip_haircut_mean_pnl = None
+    degenerate_ci_ok = (not degenerate_boot) or (
+        all_win and flip_haircut_mean_pnl is not None and flip_haircut_mean_pnl > 0.0
+    )
 
     # Expected-shortfall-style tail: mean of the worst 5% bootstrap reruns.
     q5 = np.percentile(b_pnl, 5.0)
@@ -196,7 +374,7 @@ def evaluate_frozen_rule(
 
     if n < MIN_BETS or k < MIN_EVENTS:
         verdict = "INSUFFICIENT_N"
-    elif p_adj < ALPHA and roi_ci99[0] > 0.0:
+    elif p_adj < ALPHA and roi_ci99[0] > 0.0 and degenerate_ci_ok:
         verdict = "SIGNIFICANT"
     else:
         verdict = "NOT_SIGNIFICANT"
@@ -212,7 +390,13 @@ def evaluate_frozen_rule(
         "roi_ci99": roi_ci99,
         "mean_pnl_ci95": mean_ci95,
         "mean_pnl_ci99": mean_ci99,
+        "p_boot": p_boot,
+        "p_exact": p_exact,
         "p_value": p_value,
+        "degenerate_boot": degenerate_boot,
+        "ci_conditional_on_no_loss": all_win,
+        "flip_rate_ub99": flip_rate_ub99,
+        "flip_haircut_mean_pnl": flip_haircut_mean_pnl,
         "n_tests": n_tests,
         "p_adj": p_adj,
         "verdict": verdict,

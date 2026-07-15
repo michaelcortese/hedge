@@ -46,26 +46,24 @@ logger = logging.getLogger("fetch_multi")
 ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = ROOT / "data" / "odds" / "multi"
 
-# Phase order per the research plan (coordinator revision 2, 2026-07-15):
-# LoL derivative prices first, then LoL microstructure (trades + minute
-# candles — a frozen rule needs KXLOLMAP micro urgently), then micro for the
-# three sibling MATCH-market series (between-game repricing research), then
-# the remaining price-snapshot series last.
+# Phase order per the research plan (coordinator revision 3, 2026-07-15):
+# LoL derivative prices, then LoL microstructure (trades + minute candles —
+# a frozen rule needs KXLOLMAP micro urgently), then micro for the sibling
+# GAME series paired with their MAP series (game-end clocks for a
+# confirmatory test): CS2 pair first, then Valorant, then Dota 2. The
+# remaining price-snapshot series (KXCS2TOTALMAPS, KXCODMAP, KXR6GAME,
+# KXOWGAME, and all non-LoL prices) are DROPPED — not needed.
 PHASE_PRICES_LOL = ["KXLOLMAP", "KXLOLTOTALMAPS"]
-PHASE_MICRO_GAMES = ["KXCS2GAME", "KXVALORANTGAME", "KXDOTA2GAME"]
-PHASE_PRICES_REST = [
+PHASE_MICRO_LOL = ["KXLOLMAP", "KXLOLTOTALMAPS"]
+PHASE_MICRO_GAMES = [
     "KXCS2GAME",
     "KXCS2MAP",
-    "KXVALORANTMAP",
     "KXVALORANTGAME",
-    "KXCS2TOTALMAPS",
-    "KXDOTA2MAP",
+    "KXVALORANTMAP",
     "KXDOTA2GAME",
-    "KXCODMAP",
-    "KXR6GAME",
-    "KXOWGAME",
+    "KXDOTA2MAP",
 ]
-PHASE_MICRO_LOL = ["KXLOLMAP", "KXLOLTOTALMAPS"]
+PHASE_PRICES_REST: list[str] = []
 
 SNAPSHOT_MINUTES = (5, 60, 120)
 

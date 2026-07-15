@@ -11,8 +11,11 @@ from lolpred.backtest.edge_protocol import (
     MIN_BETS,
     MIN_EVENTS,
     evaluate_frozen_rule,
+    exact_allwin_p,
+    flip_haircut_ev,
     kelly_capped_stakes,
     minimum_detectable_edge,
+    poisson_binomial_tail,
     summarize_families,
 )
 
@@ -159,16 +162,140 @@ def test_p_value_never_zero():
     assert 0.0 < r["p_value"] <= 1.0 / 1001 + 1e-12
 
 
+# -------------------------------------------- exact boundary test (audit fix)
+
+
+def test_exact_allwin_p_product_formula():
+    # Cluster A holds costs .9 and .95 (max .95); B is .8; C is .85.
+    costs = np.array([0.9, 0.95, 0.8, 0.85])
+    clusters = np.array(["A", "A", "B", "C"])
+    assert exact_allwin_p(costs, clusters) == pytest.approx(0.95 * 0.8 * 0.85)
+
+
+def test_allwin_p_value_is_exact_not_the_floor():
+    # 3-cluster all-win toy: the bootstrap p would pin at 1/(n_boot+1); the
+    # honest p is the boundary-null product over cluster max costs.
+    bets = mk_bets(
+        [0.9, 0.95, 0.8, 0.85],
+        [0.0] * 4,
+        [True] * 4,
+        tickers=["A", "A", "B", "C"],
+    )
+    r = evaluate_frozen_rule(bets, n_families_tested=1, n_boot=1000)
+    expected = 0.95 * 0.8 * 0.85
+    assert r["degenerate_boot"] is True
+    assert r["ci_conditional_on_no_loss"] is True
+    assert r["p_boot"] == pytest.approx(1 / 1001)  # the old artifact
+    assert r["p_exact"] == pytest.approx(expected)
+    assert r["p_value"] == pytest.approx(expected)  # NOT the floor
+    assert r["p_value"] == max(r["p_boot"], r["p_exact"])
+
+
+def test_allwin_91bets_51clusters_profile():
+    # The audited profile: 91 all-win bets over 51 clusters, all-in cost 0.956.
+    # Honest p = 0.956**51 ~ 0.10 — nowhere near significant, floor be damned.
+    tickers = [f"EV{i % 51}" for i in range(91)]
+    bets = mk_bets([0.946] * 91, [0.01] * 91, [True] * 91, tickers=tickers)
+    r = evaluate_frozen_rule(bets, n_families_tested=1, n_boot=2000)
+    assert r["n"] == 91 and r["n_events"] == 51
+    assert r["degenerate_boot"] is True
+    assert r["p_exact"] == pytest.approx(0.956**51)
+    assert r["p_value"] == pytest.approx(0.956**51)  # ~0.101, not 1/2001
+    assert r["p_value"] > 0.09
+    assert r["verdict"] == "NOT_SIGNIFICANT"
+
+
+def test_mixed_p_value_guard_close_to_bootstrap():
+    # With real losses the bootstrap is fine; the exact tail only guards.
+    # 20/20 coin flips at 0.5: both p's sit near P(Bin(40,.5) >= 20) ~ 0.563.
+    bets = mk_bets([0.5] * 40, [0.0] * 40, [True, False] * 20)
+    r = evaluate_frozen_rule(bets, n_families_tested=1, n_boot=4000)
+    assert r["degenerate_boot"] is False
+    assert r["ci_conditional_on_no_loss"] is False
+    assert r["flip_rate_ub99"] is None and r["flip_haircut_mean_pnl"] is None
+    assert r["p_value"] >= r["p_boot"]
+    assert r["p_value"] == max(r["p_boot"], r["p_exact"])
+    assert abs(r["p_value"] - r["p_boot"]) < 0.05
+
+
+def test_poisson_binomial_tail_vs_enumeration():
+    import itertools
+
+    probs = [0.3, 0.5, 0.7, 0.9]
+    for k_min in range(6):
+        brute = 0.0
+        for outcome in itertools.product([0, 1], repeat=4):
+            if sum(outcome) >= k_min:
+                pr = 1.0
+                for o, q in zip(outcome, probs):
+                    pr *= q if o else 1.0 - q
+                brute += pr
+        assert poisson_binomial_tail(probs, k_min) == pytest.approx(min(1.0, brute))
+    with pytest.raises(ValueError):
+        poisson_binomial_tail([0.5, 1.2], 1)
+    with pytest.raises(ValueError):
+        poisson_binomial_tail([], 0)
+
+
+def test_degenerate_flag_and_all_lose_p():
+    assert evaluate_frozen_rule(winners(10), n_families_tested=1, n_boot=200)[
+        "degenerate_boot"
+    ]
+    all_lose = mk_bets([0.5] * 10, [0.0] * 10, [False] * 10)
+    r = evaluate_frozen_rule(all_lose, n_families_tested=1, n_boot=200)
+    assert r["degenerate_boot"] is True
+    assert r["ci_conditional_on_no_loss"] is False  # losses, not wins
+    assert r["p_value"] == 1.0  # exact tail P(W >= 0) = 1
+    mixed = mk_bets([0.5] * 10, [0.0] * 10, [True] * 5 + [False] * 5)
+    assert not evaluate_frozen_rule(mixed, n_families_tested=1, n_boot=200)[
+        "degenerate_boot"
+    ]
+
+
+def test_flip_haircut_ev_hand_check():
+    costs = np.array([0.9, 0.8, 0.85])  # mean(1 - c) = 0.15
+    clusters = np.array(["A", "A", "B"])
+    assert flip_haircut_ev(costs, clusters, 0.0) == pytest.approx(0.15)
+    assert flip_haircut_ev(costs, clusters, 0.10) == pytest.approx(0.05)
+    assert flip_haircut_ev(costs, clusters, 0.20) == pytest.approx(-0.05)
+    with pytest.raises(ValueError):
+        flip_haircut_ev(costs, clusters, 1.5)
+    with pytest.raises(ValueError):
+        flip_haircut_ev(costs, clusters[:2], 0.1)
+
+
+def test_degenerate_allwin_needs_flip_haircut_cushion():
+    # All-win at cost 0.985 over 200 singleton clusters: p_exact = .985**200
+    # ~ 0.049 < ALPHA and every bootstrap replicate is positive (CI99 > 0),
+    # but the 99% flip-rate UB (1 - .01**(1/200) ~ 0.0228) exceeds the .015
+    # per-bet margin -> the haircut gate blocks SIGNIFICANT.
+    bets = mk_bets([0.985] * 200, [0.0] * 200, [True] * 200)
+    r = evaluate_frozen_rule(bets, n_families_tested=1, n_boot=2000)
+    assert r["p_adj"] < ALPHA
+    assert r["roi_ci99"][0] > 0.0
+    assert r["degenerate_boot"] is True
+    assert r["flip_rate_ub99"] == pytest.approx(1.0 - 0.01 ** (1 / 200))
+    assert r["flip_haircut_mean_pnl"] == pytest.approx(0.015 - r["flip_rate_ub99"])
+    assert r["flip_haircut_mean_pnl"] < 0.0
+    assert r["verdict"] == "NOT_SIGNIFICANT"
+
+
 # ------------------------------------------------------------- verdict logic
 
 
 def test_verdict_significant_clear_winner():
     # 40 events, one winning bet each, cheap entry: every bootstrap replicate
-    # is positive, so p ~ 1/(n_boot+1) and the CI99 lower bound is > 0.
+    # is positive, so p_boot ~ 1/(n_boot+1) and the CI99 lower bound is > 0.
+    # Post audit-fix: p_exact = 0.51**40 ~ 2e-12 << the floor, so the honest
+    # max() still reports the (more conservative) floor, and the 0.49/bet
+    # margin clears the 99% flip-rate haircut (~0.109) — still SIGNIFICANT.
     r = evaluate_frozen_rule(winners(40), n_families_tested=8, n_boot=2000)
     assert r["verdict"] == "SIGNIFICANT"
     assert r["p_adj"] < ALPHA
     assert r["roi_ci99"][0] > 0.0
+    assert r["p_value"] == pytest.approx(r["p_boot"])  # exact p is far smaller
+    assert r["ci_conditional_on_no_loss"] is True
+    assert r["flip_haircut_mean_pnl"] > 0.0
     assert r["n"] >= MIN_BETS and r["n_events"] >= MIN_EVENTS
 
 

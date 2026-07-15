@@ -60,6 +60,29 @@ a plausible edge below its MDE gets "collect more data", never "ship it".
    times families × variants tested, capped at 1;
 3. **cluster-bootstrap 99% CI lower bound on ROI > 0**.
 
+**Degenerate (all-win / all-lose) samples — the exact boundary guard.** When
+every confirmation bet wins, the cluster bootstrap can only resample wins: its
+p pins at the resolution floor 1/(n_boot+1) and its CIs are conditional on
+having seen zero losses — artifacts of n_boot, not evidence. The gate
+therefore also runs an exact test under the least-favorable null on the H0
+boundary (every bet's EV exactly zero): a claim bought at all-in cost c
+(entry + fee, pays $1) wins with probability exactly c, and within-cluster
+dependence is handled conservatively by treating each event cluster as a
+single Bernoulli that wins with probability equal to the **maximum** cost
+inside it (perfectly correlated bets win together at most as often as their
+safest member). The statistic is the number of clusters whose bets all won;
+`p_exact` is its Poisson-binomial upper tail, which for an all-win sample is
+just the product of cluster max costs (`exact_allwin_p`) — e.g. 91 wins at
+~0.956 across 51 clusters gives p ≈ 0.956^51 ≈ 0.10, nowhere near
+significant however large n_boot is. The reported `p_value` is always
+`max(p_boot, p_exact)`, the result carries `degenerate_boot` and
+`ci_conditional_on_no_loss` flags, and a degenerate all-win sample must
+additionally survive a flip-rate haircut for the ROI-CI gate to count: with
+zero cluster losses observed in k clusters the one-sided 99% upper bound on
+the per-cluster flip rate is 1 − 0.01^(1/k) (≈ 4.6/k), and
+`flip_haircut_ev` — mean pnl per bet after flipping that fraction of
+clusters to losses — must stay positive.
+
 Also reported, read before celebrating: `es5_pnl` (mean total pnl of the worst
 5% of bootstrap reruns — the unlucky-rerun loss), `max_drawdown`, and
 `break_even_extra_cost_per_bet` — how many extra dollars per bet of slippage /
