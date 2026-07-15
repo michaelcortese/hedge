@@ -261,10 +261,12 @@ class BradleyTerry:
         half_life_days: float = 60.0,
         l2: float = 2.0,
         refit_every_days: float = 7,
+        max_age_half_lives: float = 4.0,
     ) -> None:
         self.half_life_days = float(half_life_days)
         self.l2 = float(l2)
         self.refit_every_days = float(refit_every_days)
+        self.max_age_half_lives = float(max_age_half_lives)
         self._history: list[tuple[pd.Timestamp, str, str, int]] = []
         self._last_fit_date: pd.Timestamp | None = None
         self._team_index: dict[str, int] = {}
@@ -347,7 +349,18 @@ class BradleyTerry:
         )
 
     def _fit(self, fit_date: pd.Timestamp) -> None:
-        history = self._history
+        # Truncate to the decay horizon: games older than
+        # max_age_half_lives half-lives carry negligible weight
+        # (0.5**4 ~= 6%) but grow the design matrix and the O(n_teams^3)
+        # covariance inversion without bound over a decade of data.
+        max_age_days = self.half_life_days * self.max_age_half_lives
+        if np.isfinite(max_age_days) and max_age_days < 36_500:  # ~100 years
+            max_age = pd.Timedelta(days=max_age_days)
+            history = [g for g in self._history if fit_date - g[0] <= max_age]
+            if len(history) < BT_MIN_GAMES:
+                history = self._history[-BT_MIN_GAMES:]
+        else:
+            history = self._history
         teams = sorted({t for _, b, r, _ in history for t in (b, r)})
         index = {t: i for i, t in enumerate(teams)}
         n_games, n_teams = len(history), len(teams)

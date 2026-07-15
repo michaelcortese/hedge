@@ -1,0 +1,199 @@
+# lolpred — LoL esports match-winner prediction for betting
+
+A machine-learning pipeline that predicts the winner of professional League of
+Legends matches, built for betting/trading research: calibrated per-game win
+probabilities from an XGBoost model over strictly-past-only team features,
+series (best-of-N) prices by exact recursion, and a walk-forward backtest with
+a Kelly-staked betting simulation. It is honest about the hard part: esports
+betting markets are reasonably efficient, and a model that merely predicts
+winners well is not enough — you need to beat the **de-vigged** market price
+after the bookmaker margin. Nothing in this repo demonstrates real market edge
+yet (see the synthetic-odds caveat below); it demonstrates a leak-free
+evaluation harness with which such a claim could eventually be tested.
+
+## Quickstart
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+.venv/bin/python -m pytest tests/ -q          # everything should pass offline
+
+# 1. download raw Oracle's Elixir data (see Data below for the quota caveat)
+.venv/bin/python scripts/download_data.py --dest data/raw --years 2014-2026 --source auto
+
+# 2. build the feature table (also writes the games.parquet cache predict.py uses)
+.venv/bin/python scripts/build_features.py --raw data/raw --out data/processed/features.parquet
+
+# 3. walk-forward backtest + synthetic-odds betting report
+.venv/bin/python scripts/backtest.py --features data/processed/features.parquet --out-dir artifacts/backtest
+
+# 4. train the final model on everything up to a cutoff
+.venv/bin/python scripts/train.py --features data/processed/features.parquet --out-dir artifacts/model
+
+# 5. price a matchup (case-insensitive team names; suggests near-misses)
+.venv/bin/python scripts/predict.py --blue T1 --red "Gen.G" --best-of 5 \
+    --odds-blue 1.65 --odds-red 2.30
+```
+
+Note: `predict.py` recomputes features from the canonical games table at
+prediction time (no per-team feature state is persisted), so keep
+`data/processed/games.parquet` (written by `build_features.py`) or `data/raw`
+around. With the cache it takes seconds.
+
+## Data
+
+Raw data is [Oracle's Elixir](https://oracleselixir.com/) per-game match
+exports (12 rows per game: 10 players + 2 team rows), one CSV per season,
+2014–present. Full source table and quirks in [docs/data.md](docs/data.md).
+
+- **Google Drive (canonical per-year files):** Drive rate-limits downloads;
+  when the quota is exceeded it serves an HTML page instead of the CSV.
+  `download_data.py` detects this, deletes the bad file, and tells you to
+  retry later — 2024 (and 2026) may stay missing until the quota clears.
+- **Hugging Face bulk 2014–2023** and a **GitHub mirror of 2025** cover the
+  rest reliably; overlapping years are deduplicated on `gameid`.
+- All credit for the dataset goes to Tim "Magic" Sevenhuysen's Oracle's
+  Elixir. Riot Games' data policy permits personal, non-commercial analytics
+  use of esports data; this project is exactly that. Do not redistribute the
+  raw files.
+
+## Architecture
+
+```
+raw Oracle's Elixir CSVs
+  -> loader (clean, dedupe, sort by (date, gameid))
+  -> chronological feature builder (single pass, strictly past-only state)
+       - Elo stream (K=24/32, MOV multiplier, side offset, split regression)
+       - Bradley-Terry refits (time-decayed ridge logistic, theta + std error)
+       - rolling team stats (win rates, golddiffat15, first-objective rates,
+         side-specific, opponent-adjusted; windows 10/30 + ewm half-life 15)
+       - schedule/context (rest days, patch age, league, playoffs, roster continuity)
+  -> matchup rows: blue-vs-red difference features, mirrored-row augmentation
+  -> XGBoost (depth 3-4, lr 0.03, early stopping, logloss) + Platt calibration
+  -> game prob p -> series prob via exact BoN recursion
+  -> betting layer: edge vs (de-vigged) market prob, threshold + quarter-Kelly, caps
+  -> walk-forward backtest + report (Brier/logloss/calibration/ROI/drawdown/CI)
+```
+
+| module | one line |
+|---|---|
+| `lolpred/data/loader.py` | raw OE CSVs → canonical one-row-per-game blue/red table |
+| `lolpred/data/synthetic.py` | synthetic games with known latent strengths, for pipeline validation |
+| `lolpred/features/ratings.py` | online Elo stream + time-decayed Bradley-Terry rating streams |
+| `lolpred/features/build.py` | chronological feature builder — the strict-date-visibility choke point |
+| `lolpred/models/xgb.py` | `WinModel` (XGBoost + mirror augmentation + Platt) and the Elo+BT logistic baseline |
+| `lolpred/series.py` | exact best-of-N recursion: game prob → series/exact-score probs |
+| `lolpred/backtest/walkforward.py` | expanding-window folds with an embargo gap; out-of-sample predictions only |
+| `lolpred/backtest/betting.py` | odds math, synthetic bookmaker, Kelly sizing, settlement, bankroll sim |
+| `lolpred/backtest/report.py` | Brier/log-loss/ECE/reliability, momentum test, betting report text |
+| `scripts/` | the CLI front doors: download → build_features → backtest → train → predict |
+
+## Methodology
+
+- **Model games, not series.** One training row per game (≈3× the data of
+  series-level modeling); series prices come from the exact recursion
+  `S(a,b) = p·S(a+1,b) + (1−p)·S(a,b+1)` in `lolpred/series.py`. The iid
+  assumption behind the recursion is *tested*, not assumed: the backtest runs
+  a within-series momentum regression (previous-game winner vs. next-game
+  outcome, controlling for model skill).
+- **Antisymmetry by construction.** Every team-comparative feature is a
+  blue-minus-red `_diff` that exactly negates under orientation swap; training
+  doubles the data with mirrored rows, and inference averages both
+  orientations so `P(A beats B) + P(B beats A) = 1` holds identically.
+- **Strict-date visibility.** Features for a game may use only games from
+  strictly earlier calendar days; within-day games (including Bo-series
+  siblings) are mutually invisible. Enforced at a single choke point in the
+  builder and by a dedicated leakage test suite (`tests/test_leakage.py`:
+  future-mutation, fake-future, sentinel-leak tests).
+- **Walk-forward only.** Expanding window over half-year folds with a 7-day
+  embargo gap, burn-in years never tested, optional final holdout touched
+  once. No random K-fold — it leaks future ratings into the past.
+- **Calibration is the product.** The primary metric is log-loss; Platt
+  scaling is fit only on each fold's validation tail (never on test data).
+
+## Evaluation & betting
+
+The backtest reports accuracy, Brier score, log-loss, ECE with a reliability
+table, and per-fold breakdowns — always against baselines that must be beaten:
+the constant 0.5, the constant blue-side rate, the Elo+BT logistic baseline,
+and the de-vigged market probability. A GBDT that cannot beat the Elo+BT
+logistic by a meaningful log-loss margin out of sample should be replaced by
+the simpler model.
+
+**All betting numbers in this repo are computed against SYNTHETIC odds — no
+historical esports odds ship with it. The synthetic bookmaker is the
+out-of-sample baseline model's probability, shrunk, noised, and vigged. It is
+generated from the baseline rather than the evaluated model to avoid grading
+the model against itself, but the baseline is trained on the same games, so it
+is only independent-ish. Synthetic-odds ROI validates the plumbing; it is NOT
+evidence of real market edge.** Every betting section in the report carries
+this label.
+
+Stakes are quarter-Kelly (`kelly_mult 0.25`) capped at 2% of bankroll per bet,
+with a cold-start gate that refuses to bet unless both teams have ≥10 prior
+games. The report includes a compounded bankroll simulation, max drawdown, a
+bootstrap 95% CI on ROI, and a flat-stake comparison arm as a miscalibration
+canary.
+
+## Results
+
+<!-- TODO(orchestrator): fill from a scripts/backtest.py run on real data.
+     Paste artifacts/backtest/report.txt highlights here: games scored,
+     model vs baseline log-loss table, ECE, and the SYNTHETIC-odds betting
+     block with its disclaimer. -->
+
+*Pending — this section is filled from a `scripts/backtest.py` run over the
+full historical dataset.*
+
+## Limitations & roadmap
+
+- **2024 data gap** until the Google Drive quota clears for that year's file
+  (2014–2023 and 2025 download reliably from the other sources).
+- **No real historical odds.** Everything in the betting section is synthetic
+  (see above). Acquiring real closing lines is the single highest-value next
+  step — it is the only way to measure actual edge.
+- **Draft/champion and player-level models deferred.** v1 carries only a
+  roster-continuity feature; player ratings and pick/ban signal are v2
+  (collinearity eats most of the gain at this data size).
+- **Fearless draft** (champion-pool depletion across a series, in some leagues
+  from ~2025) changes late-game-number dynamics; flagged, not yet modeled.
+- **Market efficiency warning.** Pinnacle-class esports lines already embed
+  most public information. Beating the vig persistently is rare; treat any
+  backtested profit — especially synthetic-odds profit — with maximum
+  suspicion, and size accordingly (quarter-Kelly is already generous).
+
+## Repo layout
+
+```
+lolpred/
+  data/
+    loader.py        # raw CSVs -> canonical game table
+    synthetic.py     # ground-truth synthetic games for pipeline validation
+  features/
+    ratings.py       # Elo + Bradley-Terry rating streams
+    build.py         # chronological matchup feature builder
+  models/
+    xgb.py           # WinModel (XGBoost) + EloLogisticBaseline
+  backtest/
+    walkforward.py   # expanding-window folds + out-of-sample predictions
+    betting.py       # odds math, synthetic bookmaker, Kelly, settlement
+    report.py        # metrics, calibration, momentum test, report text
+  series.py          # exact best-of-N series math
+scripts/
+  download_data.py   # fetch raw Oracle's Elixir CSVs
+  build_features.py  # raw CSVs -> features.parquet (+ games.parquet cache)
+  backtest.py        # walk-forward evaluation + synthetic-odds betting report
+  train.py           # fit the final WinModel, save artifacts
+  predict.py         # price a matchup: game/series probs, fair odds, Kelly
+tests/               # unit + leakage + end-to-end script tests
+docs/                # DESIGN.md, CONTRACTS.md, data.md
+data/                # raw/ + processed/ (gitignored)
+artifacts/           # backtest reports + trained models (gitignored)
+```
+
+## License & attribution
+
+Code is MIT. The match data belongs to Oracle's Elixir and, ultimately, Riot
+Games — it is used here for personal, non-commercial analytics in line with
+Riot's data policy, and is not redistributed with this repository. If you use
+the data, credit Oracle's Elixir.

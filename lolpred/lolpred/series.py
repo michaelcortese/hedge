@@ -26,7 +26,7 @@ def series_win_prob(p: float, best_of: int, score_a: int = 0, score_b: int = 0) 
     if not 0.0 <= p <= 1.0:
         raise ValueError(f"p must be in [0, 1], got {p}")
     w = wins_needed(best_of)
-    if score_a > w or score_b > w or score_a < 0 or score_b < 0:
+    if score_a > w or score_b > w or score_a < 0 or score_b < 0 or (score_a == w and score_b == w):
         raise ValueError(f"invalid score {score_a}-{score_b} for best-of-{best_of}")
     if score_a == w:
         return 1.0

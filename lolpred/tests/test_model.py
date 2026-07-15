@@ -64,11 +64,32 @@ def fitted_model(data):
 # --------------------------------------------------------------- WinModel
 
 
-def test_antisymmetry(fitted_model, data):
+def test_orientation_semantics_blue_bump_survives(fitted_model, data):
+    """Team-swap is a different physical game: p + p(swap) - 1 equals the
+    learned blue bump (twice), which must be positive here (data intercept
+    +0.15) and of plausible size — NOT forced to zero."""
     _, _, X_te, _ = data
     p = fitted_model.predict_proba(X_te)
     p_mirr = fitted_model.predict_proba(mirror(X_te))
-    np.testing.assert_allclose(p_mirr, 1.0 - p, atol=1e-6)
+    bump = np.mean(p + p_mirr - 1.0)
+    assert 0.01 < bump < 0.2  # sigmoid(0.15)-0.5 ~= 0.037 at even matchups
+    # Base rate is recovered: features are symmetric, so mean(p) tracks the
+    # intercept-driven base rate sigmoid(0.15) ~= 0.537.
+    assert 0.50 < p.mean() < 0.60
+
+
+def test_near_antisymmetry_without_side_effect():
+    """When the training data has NO side advantage, predictions should be
+    approximately antisymmetric under team swap."""
+    rng = np.random.default_rng(3)
+    n = 2000
+    a = rng.normal(size=n)
+    X = pd.DataFrame({"f_a_diff": a, "f_ctx": rng.normal(size=n)})
+    y = (rng.random(n) < sigmoid(1.3 * a)).astype(int)
+    m = WinModel(params=FAST_PARAMS, calibrate=None, seed=0).fit(X, y)
+    p = m.predict_proba(X)
+    p_mirr = m.predict_proba(mirror(X))
+    assert np.mean(np.abs(p + p_mirr - 1.0)) < 0.04
 
 
 def test_better_than_chance_and_direction(fitted_model, data):
@@ -113,10 +134,9 @@ def test_calibration_flag_and_antisymmetry(data):
     assert m_cal.calibrated_ is True
     p = m_cal.predict_proba(X_te)
     assert np.all((p > 0) & (p < 1))
-    # Calibrator applied AFTER the two-orientation average, no intercept ->
-    # exact antisymmetry still holds.
-    p_mirr = m_cal.predict_proba(mirror(X_te))
-    np.testing.assert_allclose(p_mirr, 1.0 - p, atol=1e-6)
+    # Calibration (with intercept) keeps the predicted base rate near the
+    # observed one rather than forcing symmetry.
+    assert abs(p.mean() - y_te.mean()) < 0.05
     # No validation set -> calibration silently skipped.
     m_nocal = WinModel(params=FAST_PARAMS, calibrate="platt", seed=0).fit(X_tr, y_tr)
     assert m_nocal.calibrated_ is False
@@ -218,3 +238,34 @@ def test_baseline_nan_handling():
     p = base.predict_proba(X)
     assert np.all(np.isfinite(p))
     assert np.all((p > 0) & (p < 1))
+
+
+def test_mirror_swaps_blue_red_pairs():
+    """f_hist_games_blue/red must swap under mirroring so that externally
+    swapping the two teams is exactly the model's internal mirror."""
+    import numpy as np
+    import pandas as pd
+    from lolpred.models.xgb import WinModel
+
+    rng = np.random.default_rng(7)
+    n = 1500
+    X = pd.DataFrame(
+        {
+            "f_a_diff": rng.normal(size=n),
+            "f_hist_games_blue": rng.integers(0, 200, size=n).astype(float),
+            "f_hist_games_red": rng.integers(0, 200, size=n).astype(float),
+            "f_ctx": rng.normal(size=n),
+        }
+    )
+    y = (rng.random(n) < 1 / (1 + np.exp(-1.5 * X["f_a_diff"]))).astype(int)
+    m = WinModel(params={"n_estimators": 60, "max_depth": 3, "n_jobs": 2}, seed=0)
+    m.fit(X, y)
+    p = m.predict_proba(X)
+    X_swapped = X.copy()
+    X_swapped["f_a_diff"] = -X["f_a_diff"]
+    X_swapped["f_hist_games_blue"] = X["f_hist_games_red"]
+    X_swapped["f_hist_games_red"] = X["f_hist_games_blue"]
+    p_swapped = m.predict_proba(X_swapped)
+    # Data has no side effect, so external swap should be ~complementary.
+    # (Exact complement is NOT the contract — the persp column is active.)
+    assert np.mean(np.abs(p_swapped - (1.0 - p))) < 0.04

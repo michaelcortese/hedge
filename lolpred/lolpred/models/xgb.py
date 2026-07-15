@@ -9,35 +9,36 @@
     Logistic regression on the rating-diff features only — the "beat this"
     bar for the GBDT.
 
-Orientation / antisymmetry convention
--------------------------------------
+Orientation convention
+----------------------
 Per CONTRACTS.md the feature builder emits only antisymmetric ``*_diff``
-columns plus orientation-invariant symmetric context columns; rows are always
-blue-perspective, so the blue-side advantage lives in the intercept.  Naive
-mirror augmentation (negate ``_diff`` cols, flip labels) destroys that
-intercept.  We resolve it with a synthetic column ``f_is_blue_persp``:
+columns, ``_blue``/``_red`` swap pairs, and orientation-invariant symmetric
+context columns; rows are always blue-perspective.  Naive mirror augmentation
+(negate ``_diff`` cols, flip labels) would destroy the real blue-side
+advantage (~52-53% blue win rate in pro play), so a synthetic column
+``f_is_blue_persp`` carries it:
 
 * train time (mirror path only): ``+1`` on original rows, ``-1`` on mirrored
-  rows.  The booster can attribute the blue advantage to this column instead
-  of leaking a bias into the antisymmetric ``_diff`` features.
-* predict time: exact antisymmetry ``p(mirror(X)) == 1 - p(X)`` is required
-  by the model contract, but any perspective-dependent offset applied to the
-  as-given orientation breaks it (by construction — a real blue bump cannot
-  survive ``p + p' == 1``).  We therefore *marginalize* the perspective
-  column at inference: the booster is evaluated at both ``persp=+1`` and
-  ``persp=-1`` for each orientation and averaged, then the standard
-  two-orientation average ``p = 0.5 * (m(orig) + (1 - m(mirrored)))`` is
-  taken.  This is exactly antisymmetric for any booster, deterministic, and
-  keeps the training-time benefit of the persp column.
+  rows.  The booster attributes the blue advantage to this column instead of
+  leaking a bias into the antisymmetric ``_diff`` features.
+* predict time: each physical game has exactly two training representations —
+  (X, persp=+1, y) and (mirror(X), persp=-1, 1-y).  Prediction averages
+  those two views of the SAME game: ``p = 0.5 * (f(X,+1) + 1 - f(mirror(X),-1))``.
+  The perspective column stays active, so the blue bump survives into
+  predictions.  Consequently ``p(team-swap) != 1 - p`` in general: swapping
+  the teams is a different physical game (the other team now enjoys blue
+  side), and ``p(X) + p(swap(X)) - 1`` equals the learned blue bump (twice).
+  An earlier revision marginalized persp at predict time to force exact
+  ``p(swap) == 1 - p``; review showed that structurally erases the blue-side
+  edge (~0.025 probability bias on every row) — do not reintroduce it.
 
 Calibration
 -----------
-``calibrate="platt"`` fits a 1-D intercept-free logistic regression mapping
-the *averaged* booster logit -> label.  Leakage rule: the calibrator is fit
-on the VALIDATION set predictions; if no validation set is provided,
-calibration is silently skipped and ``self.calibrated_`` is ``False``.  The
-calibrator is applied AFTER the two-orientation average and has no intercept,
-so calibrated probabilities remain exactly antisymmetric.
+``calibrate="platt"`` fits a 1-D logistic regression (with intercept — it
+corrects residual base-rate offset) mapping the averaged booster logit ->
+label.  Leakage rule: the calibrator is fit on the VALIDATION set
+predictions; if no validation set is provided, calibration is silently
+skipped and ``self.calibrated_`` is ``False``.
 
 Early stopping (xgboost 3.x)
 ----------------------------
@@ -99,16 +100,26 @@ _LOGIT_EPS = 1e-7
 
 
 def _mirror_frame(X: pd.DataFrame) -> pd.DataFrame:
-    """Return the mirrored orientation: negate ``*_diff`` columns.
+    """Return the mirrored orientation.
 
-    Columns not ending in ``_diff`` (and not :data:`PERSP_COL`, which is never
-    present in caller frames) are symmetric context and copied unchanged.
+    * ``*_diff`` columns are negated (antisymmetric).
+    * ``<stem>_blue`` / ``<stem>_red`` column pairs are swapped (e.g.
+      ``f_hist_games_blue`` becomes the red team's count under mirroring).
+    * Everything else (and not :data:`PERSP_COL`, which is never present in
+      caller frames) is symmetric context and copied unchanged.
+
     NaNs pass through (negation of NaN is NaN).
     """
     Xm = X.copy()
     diff_cols = [c for c in X.columns if c.endswith("_diff")]
     if diff_cols:
         Xm[diff_cols] = -Xm[diff_cols].astype(float)
+    for col_blue in X.columns:
+        if col_blue.endswith("_blue"):
+            col_red = col_blue[: -len("_blue")] + "_red"
+            if col_red in X.columns:
+                Xm[col_blue] = X[col_red].to_numpy(copy=True)
+                Xm[col_red] = X[col_blue].to_numpy(copy=True)
     return Xm
 
 
@@ -176,8 +187,17 @@ class WinModel:
         y: np.ndarray,
         X_val: pd.DataFrame | None = None,
         y_val: np.ndarray | None = None,
+        X_cal: pd.DataFrame | None = None,
+        y_cal: np.ndarray | None = None,
     ) -> "WinModel":
-        """Fit the booster (early stopping iff a validation set is given)."""
+        """Fit the booster (early stopping iff a validation set is given).
+
+        If ``X_cal``/``y_cal`` are given, the Platt calibrator is fit on that
+        slice instead of on the early-stopping validation set — avoiding the
+        mild optimism of calibrating on the same rows the stopping point was
+        chosen on. Without them, the validation set is reused (documented
+        bias risk, within-train only).
+        """
         if not isinstance(X, pd.DataFrame):
             raise TypeError("X must be a pandas DataFrame")
         if PERSP_COL in X.columns:
@@ -216,15 +236,19 @@ class WinModel:
         self.model_.fit(X_fit, y_fit, **fit_kwargs)
         self.best_iteration_ = getattr(self.model_, "best_iteration", None)
 
-        # ---- calibration (leakage rule: validation predictions only) ----
+        # ---- calibration (leakage rule: never fit on training rows) ----
         self.calibrator_ = None
         self.calibrated_ = False
-        if self.calibrate == "platt" and has_val:
-            p_val = self._raw_predict(self._check_columns(X_val))
-            yv = np.asarray(y_val, dtype=int).ravel()
+        has_cal = X_cal is not None and y_cal is not None
+        if self.calibrate == "platt" and (has_cal or has_val):
+            X_c, y_c = (X_cal, y_cal) if has_cal else (X_val, y_val)
+            p_val = self._raw_predict(self._check_columns(X_c))
+            yv = np.asarray(y_c, dtype=int).ravel()
             if len(np.unique(yv)) == 2:
                 cal = LogisticRegression(
-                    fit_intercept=False,  # intercept would break antisymmetry
+                    # The intercept is load-bearing: it lets calibration
+                    # correct any residual base-rate (blue-side) offset.
+                    fit_intercept=True,
                     C=1e6,
                     solver="lbfgs",
                     max_iter=1000,
@@ -273,12 +297,19 @@ class WinModel:
         return X[want]  # same set, wrong order -> reorder by name
 
     def _raw_predict(self, X: pd.DataFrame) -> np.ndarray:
-        """Uncalibrated P(blue win); exactly antisymmetric when mirroring.
+        """Uncalibrated P(blue win) via the two training representations.
 
-        Both orientations are built (as-given and ``_diff``-negated); the
-        perspective column is marginalized (evaluated at +1 and -1, averaged)
-        so that ``p(mirror(X)) == 1 - p(X)`` holds identically for any
-        booster.  Final average: ``0.5 * (m(orig) + (1 - m(mirrored)))``.
+        Rows are blue-perspective by convention.  Each physical game has
+        exactly two training representations: (X, persp=+1) with label y and
+        (mirror(X), persp=-1) with label 1-y.  Prediction averages those two
+        views of the SAME game: ``p = 0.5 * (f(X, +1) + 1 - f(mirror(X), -1))``.
+
+        The perspective column stays ACTIVE (not marginalized): it carries the
+        real blue-side advantage (~52-53% blue win rate in pro play).  As a
+        consequence ``p(team-swap) != 1 - p(X)`` in general — swapping the
+        teams is a *different physical game* in which the other team enjoys
+        the blue-side edge; the difference ``p(X) + p(swap(X)) - 1`` is
+        (twice) the learned blue bump, exactly as it should be.
         """
         assert self.model_ is not None and self.fit_columns_ is not None
         if not self.mirror_augment:
@@ -288,17 +319,14 @@ class WinModel:
         n = len(X)
         X0 = X.reset_index(drop=True)
         Xm = _mirror_frame(X0)
-        blocks = []
-        for frame in (X0, Xm):
-            for persp in (1.0, -1.0):
-                b = frame.copy()
-                b[PERSP_COL] = persp
-                blocks.append(b[self.fit_columns_])
-        stacked = pd.concat(blocks, ignore_index=True)
+        X0 = X0.copy()
+        X0[PERSP_COL] = 1.0
+        Xm[PERSP_COL] = -1.0
+        stacked = pd.concat(
+            [X0[self.fit_columns_], Xm[self.fit_columns_]], ignore_index=True
+        )
         p = np.asarray(self.model_.predict_proba(stacked)[:, 1], dtype=float)
-        m_orig = 0.5 * (p[0:n] + p[n : 2 * n])  # persp marginalized, as-given
-        m_mirr = 0.5 * (p[2 * n : 3 * n] + p[3 * n : 4 * n])  # flipped
-        return 0.5 * (m_orig + (1.0 - m_mirr))
+        return 0.5 * (p[0:n] + (1.0 - p[n : 2 * n]))
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         """1-D array of P(blue win) for each row of ``X``."""
