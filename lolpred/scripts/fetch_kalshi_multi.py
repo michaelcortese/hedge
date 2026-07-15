@@ -46,11 +46,14 @@ logger = logging.getLogger("fetch_multi")
 ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = ROOT / "data" / "odds" / "multi"
 
-# Priority order per the research plan: LoL derivatives first (model-relevant),
-# then the liquid CS2/Valorant series, then the rest.
-PRIORITY = [
-    "KXLOLMAP",
-    "KXLOLTOTALMAPS",
+# Phase order per the research plan (coordinator revision 2, 2026-07-15):
+# LoL derivative prices first, then LoL microstructure (trades + minute
+# candles — a frozen rule needs KXLOLMAP micro urgently), then micro for the
+# three sibling MATCH-market series (between-game repricing research), then
+# the remaining price-snapshot series last.
+PHASE_PRICES_LOL = ["KXLOLMAP", "KXLOLTOTALMAPS"]
+PHASE_MICRO_GAMES = ["KXCS2GAME", "KXVALORANTGAME", "KXDOTA2GAME"]
+PHASE_PRICES_REST = [
     "KXCS2GAME",
     "KXCS2MAP",
     "KXVALORANTMAP",
@@ -62,8 +65,7 @@ PRIORITY = [
     "KXR6GAME",
     "KXOWGAME",
 ]
-
-MICRO_SERIES = ["KXLOLMAP", "KXLOLTOTALMAPS"]
+PHASE_MICRO_LOL = ["KXLOLMAP", "KXLOLTOTALMAPS"]
 
 SNAPSHOT_MINUTES = (5, 60, 120)
 
@@ -408,6 +410,59 @@ def run_micro(
 # -------------------------------------------------------------------------- main
 
 
+def ensure_markets(series: str, session: requests.Session) -> pd.DataFrame:
+    """Fetch (incrementally, cached) and persist the settled-market list."""
+    markets_path = OUT_DIR / f"{series}_markets.parquet"
+    markets_df = fetch_settled_lol_markets(
+        series_ticker=series, session=session, cache_path=markets_path,
+    )
+    markets_path.parent.mkdir(parents=True, exist_ok=True)
+    markets_df.to_parquet(markets_path, index=False)
+    logger.info("[%s] %d settled markets -> %s", series, len(markets_df), markets_path)
+    return markets_df
+
+
+def do_prices(series: str, session: requests.Session, deadline: float, report: dict) -> None:
+    if time.monotonic() > deadline:
+        logger.warning("[%s] prices skipped entirely — budget exhausted", series)
+        report[series] = {"status": "unfetched"}
+        return
+    try:
+        markets_df = ensure_markets(series, session)
+    except Exception as exc:
+        logger.error("[%s] market list fetch failed: %s", series, exc)
+        report[series] = {"status": "markets_failed", "error": str(exc)}
+        return
+    n_priced, skips, bad_titles, done = build_prices(
+        series, markets_df, OUT_DIR / f"{series}_prices.parquet", session, deadline,
+    )
+    report[series] = {
+        "status": "complete" if done else "partial",
+        "markets": len(markets_df),
+        "priced": n_priced,
+        "skips": dict(skips),
+        "example_bad_titles": bad_titles,
+    }
+    logger.info("[%s] done: %s", series, report[series])
+
+
+def do_micro(series: str, session: requests.Session, deadline: float, report: dict) -> None:
+    key = f"{series}_micro"
+    if time.monotonic() > deadline:
+        logger.warning("[%s] micro skipped — budget exhausted", series)
+        report[key] = {"status": "unfetched"}
+        return
+    try:
+        markets_df = ensure_markets(series, session)
+    except Exception as exc:
+        logger.error("[%s] market list fetch failed: %s", series, exc)
+        report[key] = {"status": "markets_failed", "error": str(exc)}
+        return
+    totals, done = run_micro(series, markets_df, session, deadline)
+    report[key] = {"status": "complete" if done else "partial", **totals}
+    logger.info("[%s] micro done: %s", series, report[key])
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--budget-min", type=float, default=135.0,
@@ -415,7 +470,7 @@ def main() -> None:
     ap.add_argument("--pace", type=float, default=0.28,
                     help="minimum seconds between HTTP GETs (shared rate limit)")
     ap.add_argument("--skip-micro", action="store_true",
-                    help="skip the trades/minute-candles phase")
+                    help="skip the trades/minute-candles phases")
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -428,54 +483,15 @@ def main() -> None:
 
     report: dict = {}
 
-    for series in PRIORITY:
-        if time.monotonic() > deadline:
-            logger.warning("[%s] skipped entirely — budget exhausted", series)
-            report[series] = {"status": "unfetched"}
-            continue
-        markets_path = OUT_DIR / f"{series}_markets.parquet"
-        prices_path = OUT_DIR / f"{series}_prices.parquet"
-        try:
-            markets_df = fetch_settled_lol_markets(
-                series_ticker=series, session=session, cache_path=markets_path,
-            )
-            markets_path.parent.mkdir(parents=True, exist_ok=True)
-            markets_df.to_parquet(markets_path, index=False)
-            logger.info("[%s] %d settled markets -> %s", series, len(markets_df), markets_path)
-        except Exception as exc:
-            logger.error("[%s] market list fetch failed: %s", series, exc)
-            report[series] = {"status": "markets_failed", "error": str(exc)}
-            continue
-
-        n_priced, skips, bad_titles, done = build_prices(
-            series, markets_df, prices_path, session, deadline,
-        )
-        report[series] = {
-            "status": "complete" if done else "partial",
-            "markets": len(markets_df),
-            "priced": n_priced,
-            "skips": dict(skips),
-            "example_bad_titles": bad_titles,
-        }
-        logger.info("[%s] done: %s", series, report[series])
-
+    for series in PHASE_PRICES_LOL:
+        do_prices(series, session, deadline, report)
     if not args.skip_micro:
-        for series in MICRO_SERIES:
-            if time.monotonic() > deadline:
-                report[f"{series}_micro"] = {"status": "unfetched"}
-                logger.warning("[%s] micro skipped — budget exhausted", series)
-                continue
-            markets_path = OUT_DIR / f"{series}_markets.parquet"
-            if not markets_path.exists():
-                report[f"{series}_micro"] = {"status": "no_market_list"}
-                continue
-            totals, done = run_micro(
-                series, pd.read_parquet(markets_path), session, deadline,
-            )
-            report[f"{series}_micro"] = {
-                "status": "complete" if done else "partial", **totals,
-            }
-            logger.info("[%s] micro done: %s", series, report[f"{series}_micro"])
+        for series in PHASE_MICRO_LOL:
+            do_micro(series, session, deadline, report)
+        for series in PHASE_MICRO_GAMES:
+            do_micro(series, session, deadline, report)
+    for series in PHASE_PRICES_REST:
+        do_prices(series, session, deadline, report)
 
     logger.info("FINAL REPORT:\n%s", json.dumps(report, indent=2, default=str))
 
