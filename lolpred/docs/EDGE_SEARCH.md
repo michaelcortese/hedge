@@ -32,7 +32,7 @@ Protocol (binding):
 | K | model-vs-map-markets | game model vs KXLOLMAP per-game books | **INSUFFICIENT_N, dead-leaning**: map book softer (+0.021 deficit vs +0.066) but beats model; vol-low blend credible in discovery, confirmation negative (n=28) |
 | M2 | frozen M-rule on maps | same frozen rule, per-map settlements | 74/74 wins, formally SIGNIFICANT — **then REFUTED by audit** (see below) |
 | AUDIT | 3 adversarial auditors on M/M2 | stats, execution, data integrity | **NET: REFUTED.** A1(stats): bootstrap p degenerate at 100% hit (floor artifact); honest exact clustered p 0.016-0.14, fails multiplicity; map evidence shares 76% of games with tuning; fire rate collapsed post-06-20. A2(execution): UPHELD-w-conditions — fills real (0/91 phantom), timing costs n not wins, capacity 10-25 lots/bet. A3(data): FATAL — outcome-conditioned side + pause-blind LP clock (12.4% of games end >2min after LP end) books hindsight wins and skips phantom losses (found one: loser bid 0.87 -> 0.03); honest ex-ante replay: confirmation window -$0.02 on 13 physical games; 91 bets = 56 physical games (mirror double-booking) |
-| M3 | cross-market clock (siblings) | sibling map-book snap (>=0.97 bid) as the game-end clock for match-book drift on CS2/VAL/Dota; side ex-ante (the side that snapped) — no look-ahead possible by construction | round 5 — the last live candidate; pre-registered before sibling data touched |
+| M3 | cross-market clock (siblings) | sibling map-book snap (>=0.97 bid) as the game-end clock for match-book drift on CS2/VAL/Dota; side ex-ante (the side that snapped) — no look-ahead possible by construction | **INSUFFICIENT_N — campaign-terminal** (2026-07-16, full pre-registered universe, one look, no retuning): 1,819 paired fixtures -> 19 bets, 19/19 wins, ROI +5.5%, but exact clustered p 0.359, p_adj 1.0, flip-haircut EV −0.16/bet. Dominant exclusion: 657 fixtures where the match ask at clock+2min was already >0.97 (637 at exactly 1.00) — sibling books reprice inside the window; the LoL drift was the anomaly. Audit-class flags: 15/19 format-inference contradictions, 16/19 sub-0.90 prints after entry (many "clinches" were mid-match favorites at fair value). Artifacts: scripts/m3_confirmatory.py, docs/evidence/m3_final_output.txt, m3_bets_final.parquet |
 | F | cross-market-structure | game/map/totals/outright consistency; sibling esports | **DEAD as arb** (books coherent; 1c fee floor kills residuals). **Data win: ~18k settled markets across 13 series; KXLOLMAP n=1,988 per-game markets** |
 | G | join-rescue + selection QA | | **DONE**: matched 970/1,010 via verified alias table; headline firmer (+0.066 logloss, CI [+0.043,+0.090]) |
 | H | market-only-residual | drift/flow/round-number/composite | **DEAD** except lead: low-volume calibration slope 1.56 [1.22,2.03], thin favorites +2-5c gross, fails at touch by ~2c -> handed to E2; possible May->June decay |
@@ -69,3 +69,49 @@ AND positive flip-haircut EV AND no audit-3-class timing contradiction
 => claim stands, subject to one final independent audit. Anything else =>
 campaign reports the fallback (strongest derivation + exact gap). No retuning,
 no second look, regardless of outcome.
+
+**OUTCOME (2026-07-16): the else-branch fired. Campaign CONCLUDED — final
+report below.**
+
+## FINAL REPORT (campaign concluded 2026-07-16)
+
+No strategy with a statistically significant edge was found that survives
+adversarial audit. 15 families were tested to rigorous verdicts (registry
+above); the strongest candidate was refuted by audit and its pre-registered
+causally-clean redesign (M3) came back INSUFFICIENT_N under a one-look,
+no-retuning protocol.
+
+**Strongest rigorously proved derivation.** The settlement-latency mechanism
+is real and executable: after a decisive game ends, Kalshi esports books can
+remain stale for ~1–2 minutes; fills at those stale quotes are real (audit-2:
+0/91 phantom, ~10–25 lots/bet capacity on LoL; up to ~1,000s of contracts
+printed near entry on CS2/VAL). On LoL match books this produced formally
+significant backtest P&L — which was then shown to be an artifact of a
+pause-blind external clock plus outcome-conditioned side selection (audit-3);
+the honest ex-ante replay is ≈ $0. On CS2/VAL/Dota, where a causally-clean
+in-market clock exists (sibling map-book snaps), the market itself closes the
+window: in 657 of the 676 gate-evaluated fixtures the match ask had already
+repriced to >0.97 (usually 1.00) within 2 minutes. What survives when every
+gate is honest: 19 bets over ~2.5 months, all winners, +5.5% ROI — a sample
+whose exact clustered p is 0.359 and whose win-loss profile is consistent
+with buying ~0.94-priced favorites at fair value.
+
+**Exact remaining gap.** To promote the mechanism to a validated strategy one
+of the following is required, neither obtainable from public historical data:
+(a) ~200 all-win fixture-clusters at ~0.94 cost under a trustworthy ex-ante
+clock — at the observed honest fire rate (~19 per quarter across all three
+sibling series) that is ~2.5 years of history that does not exist on Kalshi
+(esports series listed only since ~2026-05); or (b) forward paper trading
+with a live game-end feed (direct spectator/API feed, faster than the map
+book), which converts the latency from "already repriced" to "first to act"
+— the only version of this edge that is structurally plausible, and it is a
+speed game, not a statistical one.
+
+**Capacity even in the best case** is ~$100–400/quarter at observed prints
+(median ~2k contracts within ±5min at entry price on siblings, but entry
+edge ≤ ~5c and fire rate ~6/month). This does not justify live deployment.
+The reusable assets: the hardened acceptance machinery
+(`backtest/edge_protocol.py` — exact clustered Poisson-binomial p, flip-rate
+haircut, multiplicity), the multi-series Kalshi ingestion
+(`scripts/fetch_kalshi_multi.py`, ~18k settled markets), and the matched
+model-vs-market evaluation harness (`scripts/eval_vs_kalshi.py`).

@@ -1,4 +1,12 @@
-# Resume state — edge-search campaign (written 2026-07-15 ~19:35, before shutdown)
+# Resume state — edge-search campaign
+
+**OBSOLETE (2026-07-16): campaign CONCLUDED.** The fetch completed (CS2MAP
+99.7%, VAL/Dota 100%), M3 ran once on the full pre-registered universe, and
+the else-branch of the decision rule fired (INSUFFICIENT_N: 19/19 wins but
+exact clustered p 0.359, negative flip-haircut EV). See the FINAL REPORT in
+`docs/EDGE_SEARCH.md`. Nothing below needs resuming.
+
+---
 
 Everything below survives reboot. Only running processes died at shutdown.
 

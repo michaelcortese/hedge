@@ -1,0 +1,238 @@
+==== M3 FINAL (pooled universe: CS2 + VALORANT + DOTA2) ====
+{
+ "KXCS2GAME": {
+  "game_fixtures_total": 1285,
+  "map_fixtures_total": 1146,
+  "paired_fixtures": 1117,
+  "game_fixtures_no_maps": 168,
+  "map_fixtures_no_game": 29,
+  "team_pair_mismatch": 0,
+  "map_candle_ticker_coverage": 0.9972
+ },
+ "KXVALORANTGAME": {
+  "game_fixtures_total": 437,
+  "map_fixtures_total": 436,
+  "paired_fixtures": 423,
+  "game_fixtures_no_maps": 14,
+  "map_fixtures_no_game": 13,
+  "team_pair_mismatch": 1,
+  "map_candle_ticker_coverage": 1.0
+ },
+ "KXDOTA2GAME": {
+  "game_fixtures_total": 370,
+  "map_fixtures_total": 285,
+  "paired_fixtures": 279,
+  "game_fixtures_no_maps": 91,
+  "map_fixtures_no_game": 6,
+  "team_pair_mismatch": 61,
+  "map_candle_ticker_coverage": 1.0
+ }
+}
+
+-- exclusions --
+reason
+no_clinch_observed              985
+gate:ask>0.97                   657
+no_match_book_state_at_entry     60
+gate:bid<0.85                    18
+match_unsettled                  13
+map_book_candles_missing          2
+gate:ask>0.97+bid<0.85            2
+gate:ask>0.97+liveness            1
+
+gate-failed entry ask distribution:
+count    678.000000
+mean       0.994587
+std        0.034252
+min        0.570000
+25%        1.000000
+50%        1.000000
+75%        1.000000
+max        1.000000
+ask
+0.57      1
+0.62      1
+0.66      1
+0.78      2
+0.79      1
+0.81      1
+0.83      1
+0.85      2
+0.86      3
+0.88      3
+0.90      1
+0.95      1
+0.98      5
+0.99     18
+1.00    637
+
+-- snaps: 2915 side-snaps; settled 2915; false-snap rate (lost MAP) 0.0038 (11/2915); snap-side lost MATCH 0.2123 (619/2915)
+
+-- bets fired: 19
+per-series bet counts: {'KXVALORANTGAME': 12, 'KXCS2GAME': 6, 'KXDOTA2GAME': 1}
+            series                  slug                     clock  entry_price  bid_at_entry   fee   won  contra_entry_bar  doubt_after_entry  capacity_contracts_5min    month
+0        KXCS2GAME     26JUL030400ENTINF 2026-07-03 09:25:00+00:00         0.96          0.90  0.01  True             False              False                  1202.94  2026-07
+1        KXCS2GAME   26JUL130630HONBRUTE 2026-07-13 06:27:00+00:00         0.91          0.85  0.01  True              True               True                 14023.66  2026-07
+2        KXCS2GAME    26JUN041300HEROLIQ 2026-06-04 18:47:00+00:00         0.95          0.93  0.01  True             False               True                 26519.52  2026-06
+3        KXCS2GAME      26MAY170800FALTS 2026-05-17 13:12:00+00:00         0.92          0.90  0.01  True             False               True                 21463.45  2026-05
+4        KXCS2GAME     26MAY171415NAVIGL 2026-05-17 20:12:00+00:00         0.97          0.96  0.01  True             False               True                 13267.92  2026-05
+5        KXCS2GAME     26MAY282100VOCM80 2026-05-29 02:59:00+00:00         0.95          0.94  0.01  True             False               True                 14146.18  2026-05
+6   KXVALORANTGAME      26JUL051100RBNEP 2026-07-05 16:42:00+00:00         0.89          0.87  0.01  True             False               True                  4298.04  2026-07
+7   KXVALORANTGAME  26JUL1015009ZKRSPARK 2026-07-10 21:00:00+00:00         0.94          0.90  0.01  True             False               True                   546.21  2026-07
+8   KXVALORANTGAME      26JUL111600SRSAD 2026-07-11 21:58:00+00:00         0.93          0.91  0.01  True             False               True                  2092.28  2026-07
+9   KXVALORANTGAME     26JUL121100SGECLK 2026-07-12 16:33:00+00:00         0.94          0.88  0.01  True             False               True                  1704.15  2026-07
+10  KXVALORANTGAME     26JUN200900LEVEDG 2026-06-20 14:41:00+00:00         0.95          0.94  0.01  True             False               True                 33518.66  2026-06
+11  KXVALORANTGAME      26MAY141100TLAEP 2026-05-14 17:48:00+00:00         0.94          0.85  0.01  True             False               True                  1913.63  2026-05
+12  KXVALORANTGAME       26MAY170600PRFS 2026-05-17 12:04:00+00:00         0.94          0.90  0.01  True             False               True                   627.72  2026-05
+13  KXVALORANTGAME      26MAY200500AGTEC 2026-05-20 10:34:00+00:00         0.97          0.87  0.01  True             False              False                    57.08  2026-05
+14  KXVALORANTGAME    26MAY271100UCAMRBN 2026-05-27 16:27:00+00:00         0.93          0.91  0.01  True             False               True                  1367.66  2026-05
+15  KXVALORANTGAME   26MAY282000LOUD100T 2026-05-30 01:41:00+00:00         0.96          0.95  0.01  True             False               True                  1095.99  2026-05
+16  KXVALORANTGAME    26MAY311100BBLNAVI 2026-05-31 16:46:00+00:00         0.87          0.86  0.01  True              True               True                  8917.95  2026-05
+17  KXVALORANTGAME    26MAY312000NRGLOUD 2026-06-01 01:51:00+00:00         0.95          0.94  0.01  True             False               True                 11010.81  2026-06
+18     KXDOTA2GAME  26JUL120800NEMIGAREA 2026-07-12 14:07:00+00:00         0.95          0.93  0.01  True             False              False                     4.39  2026-07
+
+contra_entry_bar violations: 2
+format_misinferred_diag (outcome-based, diagnostic only): 15 of 19
+bets whose clinch walk used a mis-decided map: 0
+doubt_after_entry flagged: 16
+doubt rel clock (min) distribution:
+count     19.000000
+mean      38.013876
+std       39.697655
+min      -17.229782
+25%       12.187779
+50%       27.934039
+75%       60.034510
+max      130.640555
+
+month splits:
+         n  wins  avg_entry   pnl  staked
+month                                    
+2026-05  9     9   0.938889  0.46    8.54
+2026-06  3     3   0.950000  0.12    2.88
+2026-07  7     7   0.931429  0.41    6.59
+
+capacity: median 2092.2799999999997 mean 8304.117894736843
+
+==== VERDICT (clusters=fixture event_ticker) ====
+{
+ "n": 19,
+ "n_events": 19,
+ "staked": 18.01,
+ "pnl": 0.9900000000000004,
+ "roi": 0.054969461410327616,
+ "mean_pnl_per_bet": 0.05210526315789476,
+ "roi_ci95": [
+  0.04338275672707306,
+  0.06861642294713163
+ ],
+ "roi_ci99": [
+  0.04052573932092007,
+  0.07344632768361582
+ ],
+ "mean_pnl_ci95": [
+  0.041578947368421076,
+  0.0642105263157895
+ ],
+ "mean_pnl_ci99": [
+  0.038947368421052654,
+  0.06842105263157895
+ ],
+ "p_boot": 9.999000099990002e-05,
+ "p_exact": 0.3593336351905635,
+ "p_value": 0.3593336351905635,
+ "degenerate_boot": true,
+ "ci_conditional_on_no_loss": true,
+ "flip_rate_ub99": 0.21524002964853872,
+ "flip_haircut_mean_pnl": -0.16313476649064398,
+ "n_tests": 360,
+ "p_adj": 1.0,
+ "verdict": "INSUFFICIENT_N",
+ "es5_pnl": 0.781102362204725,
+ "max_drawdown": 0.0,
+ "break_even_extra_cost_per_bet": 0.05210526315789476,
+ "seed": 0,
+ "n_boot": 10000
+}
+
+==== STRESS (clusters=day) ====
+{
+ "n": 19,
+ "n_events": 16,
+ "staked": 18.01,
+ "pnl": 0.9900000000000004,
+ "roi": 0.054969461410327616,
+ "mean_pnl_per_bet": 0.05210526315789476,
+ "roi_ci95": [
+  0.04438642297650132,
+  0.06894708711918762
+ ],
+ "roi_ci99": [
+  0.041666666666666706,
+  0.07405371566868439
+ ],
+ "mean_pnl_ci95": [
+  0.04250000000000002,
+  0.06450000000000003
+ ],
+ "mean_pnl_ci99": [
+  0.040000000000000036,
+  0.06894786967418541
+ ],
+ "p_boot": 9.999000099990002e-05,
+ "p_exact": 0.42812216387044777,
+ "p_value": 0.42812216387044777,
+ "degenerate_boot": true,
+ "ci_conditional_on_no_loss": true,
+ "flip_rate_ub99": 0.2501057906675441,
+ "flip_haircut_mean_pnl": -0.1980005275096494,
+ "n_tests": 360,
+ "p_adj": 1.0,
+ "verdict": "INSUFFICIENT_N",
+ "es5_pnl": 0.7376504854368937,
+ "max_drawdown": 0.0,
+ "break_even_extra_cost_per_bet": 0.05210526315789476,
+ "seed": 0,
+ "n_boot": 10000
+}
+
+==== VERDICT excluding doubt-after-entry flags ====
+{
+ "n": 3,
+ "n_events": 3,
+ "staked": 2.91,
+ "pnl": 0.09000000000000011,
+ "roi": 0.030927835051546428,
+ "mean_pnl_per_bet": 0.030000000000000037,
+ "roi_ci95": [
+  0.02040816326530615,
+  0.04166666666666671
+ ],
+ "roi_ci99": [
+  0.02040816326530615,
+  0.04166666666666671
+ ],
+ "mean_pnl_ci95": [
+  0.020000000000000025,
+  0.04000000000000004
+ ],
+ "mean_pnl_ci99": [
+  0.020000000000000025,
+  0.04000000000000004
+ ],
+ "p_boot": 9.999000099990002e-05,
+ "p_exact": 0.9125759999999999,
+ "p_value": 0.9125759999999999,
+ "degenerate_boot": true,
+ "ci_conditional_on_no_loss": true,
+ "flip_rate_ub99": 0.7845565309968117,
+ "flip_haircut_mean_pnl": -0.7545565309968116,
+ "n_tests": 360,
+ "p_adj": 1.0,
+ "verdict": "INSUFFICIENT_N",
+ "es5_pnl": 0.06743642611683855,
+ "max_drawdown": 0.0,
+ "break_even_extra_cost_per_bet": 0.030000000000000037,
+ "seed": 0,
+ "n_boot": 10000
+}
