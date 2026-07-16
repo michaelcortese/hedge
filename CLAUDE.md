@@ -283,7 +283,15 @@ Develop and backtest against **demo** before pointing at prod.
   maker usually free. Coefficient is **not** universally 0.07 — pull the official
   Fee Schedule PDF and key it per market for production edge math. Settlement is
   free (holding to expiry costs no exit fee).
-- **Rate limits:** token bucket; Basic tier ≈ 20 reads/s, 10 writes/s.
+- **Rate limits:** token bucket (2026 regime): Basic = 200 read / 100 write
+  tokens/s, most calls cost 10 tokens (≈20 reads / 10 writes per second); 429s
+  carry no Retry-After header — self-clock. Per-endpoint costs at
+  `GET /account/endpoint_costs`. Perps traffic has its own separate buckets.
+- **Perps (crypto perpetuals, June 2026):** separate API surface under
+  `/trade-api/v2/margin/*` on `external-api.kalshi.com` (demo:
+  `external-api.demo.kalshi.co`); public market data + funding endpoints;
+  fees 12bps taker / 5bps maker (base tier). Read-only client:
+  `hedge/kalshi/perps.py`; research: `docs/PERP_STRATEGY.md`.
 
 ---
 
