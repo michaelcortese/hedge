@@ -27,7 +27,9 @@ A finding is a **mechanism dossier**, not a theme. It must contain ALL of:
    crossing → net edge. Net must plausibly clear ~2¢/contract or the maker path
    must be explicit.
 4. **Capacity** — rough $/day at real book depth. A true edge with $20 capacity
-   is a hobby; say so.
+   is a hobby; say so. If depth is unobservable, say **unknown** — never invent
+   a number; unknown capacity becomes the first thing the falsification test
+   measures.
 5. **Data plan** — the exact data source (URL, cost, latency) a strategy would
    consume.
 6. **Falsification test** — the cheapest experiment that could kill it
@@ -50,8 +52,12 @@ Do this yourself, in-session, cheaply:
 2. **Build the known-dead list.** Read the memory directory index and any
    files touching prior research (perps research, weather tournament thesis,
    calibration post-mortems) plus `docs/PERP_STRATEGY.md` if perps are in
-   scope. Extract every edge already investigated and its verdict. Agents run
-   in fresh contexts — they rediscover dead edges unless told.
+   scope. Extract every edge already investigated and its verdict, in two
+   tiers: **data-dead** (killed by a real experiment, backtest, or losses —
+   binding) and **audit-killed** from prior hunts (killed by reasoning only —
+   soft; resubmission allowed with a new mechanism or a direct rebuttal of the
+   recorded kill reason). Agents run in fresh contexts — they rediscover dead
+   edges unless told.
 3. **Assemble the house-facts block** (below), the dead list, and the family
    roster into the workflow's `args`. Everything an agent needs must be in its
    prompt; workflow agents cannot see this session.
@@ -100,12 +106,20 @@ Manage the fleet dynamically. No fixed "N agents for family X". Heuristics:
   not wording ("NWS obs lag" and "BLS release lag" are the same family:
   latency). Next round, weight generation toward underexplored families.
 - **Blocked-route ledger.** Every audited kill goes in a ledger with its exact
-  reason. A blocked mechanism is only reopened for a *materially new*
-  mechanism — new data source, new market class, new execution path — never
-  for optimism.
-- **Adversarial audit everything.** Every dossier faces a kill-panel (lenses
-  below). A kill requires a named concrete defect; "seems hard" is a caveat,
-  not a kill. One concrete kill → blocked.
+  reason and its basis (checkable vs judgment). A blocked mechanism is
+  reopened only for a *materially new* mechanism — new data source, new market
+  class, new execution path — never for optimism. Judgment-based kills are
+  softer: a future hunt may also reopen one by directly rebutting the recorded
+  reason.
+- **Adversarial audit everything — with a kill bar calibrated to the
+  evidence.** Every dossier faces a kill-panel (lenses below). A kill vote
+  requires a named concrete defect; "seems hard" is a caveat. Blocking takes
+  either one **checkable** kill (arithmetic error in the edge math, house-facts
+  contradiction, dead-list repeat with no new mechanism) or **2-of-3 judgment
+  kills**. A single judgment kill only *wounds*: the dossier gets one rebuttal
+  pass to answer the objection, then a re-audit decides. At research stage the
+  auditors are guessing too — a false survivor costs one cheap falsification
+  test; a false kill silently loses an edge.
 - **Demand artifacts, reject status reports.** Agents return dossiers matching
   the schema or nothing. "Promising area, needs more research" is a null
   result.
@@ -122,7 +136,9 @@ Manage the fleet dynamically. No fixed "N agents for family X". Heuristics:
 ## The Kalshi kill list (audit lenses)
 
 Run every dossier through three adversarial auditors, one lens each, each
-prompted to **refute**:
+prompted to **refute** and to label any kill `checkable` (verifiable from the
+dossier + house facts alone) or `judgment` (the auditor's own estimates
+disagree):
 
 1. **fees-execution** — net edge after taker fee and realistic spread cross;
    is the maker path viable (queue, adverse selection on news)? Real book
@@ -174,7 +190,7 @@ const DOSSIER_SCHEMA = { type: 'object',
     edge_math: { type: 'object', required: ['gross_edge_cents', 'fee_cents', 'spread_cents', 'net_edge_cents'],
       properties: { gross_edge_cents: { type: 'number' }, fee_cents: { type: 'number' },
         spread_cents: { type: 'number' }, net_edge_cents: { type: 'number' } } },
-    capacity_usd_per_day: { type: 'number' },
+    capacity_usd_per_day: { type: ['number', 'null'], description: 'null if book depth is unobservable to you — never invent a number' },
     data_sources: { type: 'array', items: { type: 'object', required: ['name', 'url', 'cost', 'latency'],
       properties: { name: { type: 'string' }, url: { type: 'string' }, cost: { type: 'string' }, latency: { type: 'string' } } } },
     falsification_test: { type: 'string', description: 'cheapest experiment that could kill this' },
@@ -182,9 +198,15 @@ const DOSSIER_SCHEMA = { type: 'object',
     open_questions: { type: 'array', items: { type: 'string' } },
   } }
 
-const VERDICT_SCHEMA = { type: 'object', required: ['kill', 'reason', 'caveats'],
+const VERDICT_SCHEMA = { type: 'object', required: ['kill', 'kill_basis', 'reason', 'caveats'],
   properties: { kill: { type: 'boolean', description: 'true ONLY with a named concrete defect' },
+    kill_basis: { type: 'string', enum: ['checkable', 'judgment', 'none'],
+      description: 'checkable = verifiable from dossier + house facts alone (arithmetic error, house-facts contradiction, dead-list repeat); judgment = your own estimates disagree; none = no kill' },
     reason: { type: 'string' }, caveats: { type: 'array', items: { type: 'string' } } } }
+
+const REBUT_SCHEMA = { type: 'object', required: ['concede'],
+  properties: { concede: { type: 'boolean' }, concede_reason: { type: 'string' },
+    dossier: DOSSIER_SCHEMA } }
 
 const norm = s => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
 const CTX = `RESEARCH QUESTION: ${args.question}\n\nHOUSE FACTS (binding):\n${args.houseFacts}\n\nKNOWN-DEAD EDGES (do not resubmit without a materially NEW mechanism):\n${args.deadList}`
@@ -193,8 +215,11 @@ const genPrompt = (f, round) => `You are one independent researcher in a fleet h
 
 const devPrompt = h => `Develop this Kalshi edge hypothesis into a concrete mechanism dossier. Verify with web research — find the actual data source (URL, cost, latency), actual example markets, and do honest fee-aware edge math.\n\n${CTX}\n\nHYPOTHESIS (${h.mechanism_key}): ${h.thesis}\nMarkets: ${(h.markets || []).join(', ')}\n\nRules: net edge = gross − taker fee − expected spread cross; if the maker path is the claim, say how it survives adverse selection. Estimate capacity from real book depth if observable. The falsification test must be the CHEAPEST experiment that could kill the idea. If the hypothesis dies during development, say exactly why instead of forcing a dossier.`
 
-const auditPrompt = (d, lens) => `You are an adversarial auditor. Your job is to REFUTE this Kalshi strategy dossier through the "${lens}" lens. A kill requires a NAMED CONCRETE DEFECT (wrong fee math, no capacity, settlement-source mismatch, data-snooped edge, dead-list repeat, informed counterparty, uncapturable latency). "Seems hard" or "uncertain" is a caveat, not a kill.\n\n${CTX}\n\nDOSSIER:\n${JSON.stringify(d, null, 1)}`
+const auditPrompt = (d, lens) => `You are an adversarial auditor. Try to REFUTE this Kalshi strategy dossier through the "${lens}" lens. A kill requires a NAMED CONCRETE DEFECT (wrong fee math, no capacity, settlement-source mismatch, data-snooped edge, dead-list repeat, informed counterparty, uncapturable latency). Label its basis honestly: "checkable" ONLY if verifiable from the dossier plus the house facts alone (arithmetic error, house-facts contradiction, dead-list repeat with no new mechanism); "judgment" if your own estimates or reasoning merely disagree with the dossier's. "Seems hard" or "uncertain" is a caveat, not a kill. Remember the asymmetry: a false survivor costs one cheap falsification test; a false kill silently loses an edge.\n\n${CTX}\n\nDOSSIER:\n${JSON.stringify(d, null, 1)}`
 
+const rebutPrompt = w => `Your Kalshi edge dossier received one adversarial objection. Answer it directly with evidence or revised numbers — or concede if it is right; if the objection stands, conceding is the correct output. Do not hand-wave.\n\n${CTX}\n\nDOSSIER:\n${JSON.stringify(w.dossier, null, 1)}\n\nOBJECTION [${w.objection.lens}]: ${w.objection.reason}\n\nReturn concede=true with a reason, or concede=false plus the FULL revised dossier addressing the objection.`
+
+const LENSES = ['fees-execution', 'statistics', 'settlement-counterparty']
 const seen = new Map(), blocked = [], survivors = []
 let dry = 0, round = 0
 const maxRounds = args.maxRounds || 4
@@ -223,16 +248,37 @@ while (round < 2 || (dry < 2 && round < maxRounds && (!budget.total || budget.re
   const results = await pipeline(fresh,
     h => agent(devPrompt(h), { label: `dev:${norm(h.mechanism_key)}`, phase: 'Develop', schema: DOSSIER_SCHEMA }),
     (dossier, h) => !dossier ? null :
-      parallel(['fees-execution', 'statistics', 'settlement-counterparty'].map(lens => () =>
+      parallel(LENSES.map(lens => () =>
         agent(auditPrompt(dossier, lens), { label: `audit:${lens}:${norm(h.mechanism_key)}`, phase: 'Audit', schema: VERDICT_SCHEMA })
+          .then(v => v && { ...v, lens })
       )).then(vs => ({ h, dossier, verdicts: vs.filter(Boolean) }))
   )
 
+  const wounded = []
   for (const r of results.filter(Boolean)) {
     const kills = r.verdicts.filter(v => v.kill)
-    if (kills.length) blocked.push({ key: norm(r.h.mechanism_key), family: r.h.family, reason: kills.map(v => v.reason).join(' | ') })
+    const checkable = kills.filter(v => v.kill_basis === 'checkable')
+    if (checkable.length || kills.length >= 2)
+      blocked.push({ key: norm(r.h.mechanism_key), family: r.h.family, basis: checkable.length ? 'checkable' : 'judgment-2of3',
+        reason: kills.map(v => `[${v.lens}] ${v.reason}`).join(' | ') })
+    else if (kills.length === 1) wounded.push({ ...r, objection: kills[0] })
     else survivors.push({ ...r.dossier, family: r.h.family, caveats: r.verdicts.flatMap(v => v.caveats || []) })
   }
+
+  // single judgment kill only wounds: one rebuttal pass, re-audited by the objecting lens
+  await pipeline(wounded,
+    w => agent(rebutPrompt(w), { label: `rebut:${norm(w.h.mechanism_key)}`, phase: 'Audit', schema: REBUT_SCHEMA }),
+    async (r, w) => {
+      const key = norm(w.h.mechanism_key)
+      if (!r || r.concede || !r.dossier) {
+        blocked.push({ key, family: w.h.family, basis: 'judgment-conceded', reason: `[${w.objection.lens}] ${(r && r.concede_reason) || w.objection.reason}` })
+        return
+      }
+      const v = await agent(auditPrompt(r.dossier, w.objection.lens), { label: `reaudit:${key}`, phase: 'Audit', schema: VERDICT_SCHEMA })
+      if (v && v.kill) blocked.push({ key, family: w.h.family, basis: v.kill_basis === 'checkable' ? 'checkable' : 'judgment-sustained', reason: `[${w.objection.lens}] ${v.reason}` })
+      else survivors.push({ ...r.dossier, family: w.h.family, caveats: [...w.verdicts.flatMap(x => x.caveats || []), ...((v && v.caveats) || [])] })
+    }
+  )
   log(`round ${round} done: ${survivors.length} survivors, ${blocked.length} blocked total`)
 }
 
@@ -247,14 +293,21 @@ Scale to the ask: default ~6 generators/round, 2+ rounds. "Be thorough" or a
 
 1. Read the returned `survivors` and `blocked`. If a completed run looks
    empty/odd, check the run's `journal.jsonl` before diagnosing.
-2. Rank survivors by `net_edge_cents × capacity`, discounted by caveat
+2. Rank survivors by net edge and (when known) capacity, discounted by caveat
    severity and by how far they sit from the proven edge class (latency).
+   Unknown capacity is not zero — it becomes the first thing the
+   falsification test measures.
 3. Write the report to `data/research/edge-hunt-<slug>-<YYYY-MM-DD>.md`:
    ranked survivor dossiers (with falsification test and repo plan), then the
-   **blocked ledger with exact kill reasons** — the ledger is half the value;
-   it stops the next hunt from re-researching corpses.
-4. Update memory: append newly blocked mechanisms to the known-dead-edges
-   memory (or create one), and note surviving candidates as project memory.
+   **blocked ledger with exact kill reasons and their basis** (`checkable` vs
+   `judgment-*`) — the ledger is half the value; it stops the next hunt from
+   re-researching corpses.
+4. Update memory with tier discipline: only **data-earned** kills — checkable
+   defects, or edges killed by a real experiment/backtest/losses — go into
+   the permanent known-dead-edges memory. Judgment kills stay in the report
+   ledger only, marked audit-killed; a future hunt may resubmit them with a
+   new mechanism or a rebuttal of the recorded reason. Note surviving
+   candidates as project memory.
 5. Deliver in chat: top 3–5 survivors with one-line mechanism + net edge +
    capacity + the single cheapest next experiment for each.
 
