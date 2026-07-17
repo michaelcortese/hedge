@@ -1,101 +1,150 @@
-"""In-event hazard strategy for Kalshi word-mention markets.
+"""In-event theta-decay strategy for Kalshi word-mention markets (r3 spec).
 
-Mechanism (backtested on 15,612 settled mention markets, 2025-01..2026-07):
+Mechanism (certified against TRUE event clocks, 2026-07-17 round-3 audit):
 a mention market resolves YES the instant the phrase is uttered; NO must
-survive to event end. Mid-event, the market under-decays P(YES) as time
-elapses without a mention — retail holds YES lottery tickets, and NO carry
-is capital-inefficient, so nobody corrects it. Empirically (event-clustered):
-at 40% of the event window, 30-50c markets are priced ~40c but resolve YES
-only ~22% of the time.
+survive to event end. In-event, the crowd does not decay P(YES) as the
+window shrinks — gross NO edge on 20-80c still-open markets grows from
++11c at 50% elapsed to +22c at 90% elapsed (event-clustered p<1e-4, all
+six ground-truth families). Full campaign provenance, kill ledger, and
+certification tables: data/research/edge-hunt-mentions-2026-07-16.md.
 
-The signal: for a mention market whose event window is ACTIVE (fraction
-elapsed = tau) and which is still unresolved, the calibrated true probability
-is
+What survived three adversarial audit rounds (and what did not):
+- KILLED: anchoring on Kalshi close_time (administrative, hours late —
+  MLB median +776 min after the real game end). This strategy requires
+  the runner to supply REAL event windows from external feeds.
+- KILLED: maker/resting-order capture (queue adverse selection) and any
+  entry model cheaper than the live NO ask (books are wide exactly where
+  the modeled edge looked biggest).
+- CERTIFIED at real NO asks, taker, T = true_end - 60min (pre-specified
+  bar p<0.01, n>=15 events): hearings +10.79c/ct p=0.0085 (15 ev,
+  smallest-viable) — and, pooled across families, a flow-gated variant
+  (enter only after a taker-YES print) +3.46c p=0.0018.
 
-    logit(p_true) = A + B * logit(price) + C * tau
+The signal: for a still-open mention market with true-elapsed fraction
+tau and price p,
 
-fit on the full settled dataset with event-clustered SEs (see
-scripts/research_inevent_hazard.py and data/research/mentions/REPORT.md).
-The strategy reports that p_true; the framework's engine sees market price >>
-p_true and buys NO. Execution note: the edge survives only on the MAKER path
-(post-only NO bids at the standing level, zero maker fee, fixed small clips);
-taker crossing eats most of it. Pair with post_only execution and small
-per-market size caps.
+    logit(p_true) = A + A_FAM[family] + B*logit(p) + C*tau
 
-Out-of-sample (pre-registered rule, events never seen in formation):
-maker +10.2c/contract, CI95 [+5.0, +15.3], p<1e-4, 349 fills / 84 events;
-survives causal window definition (+7.7c, p=0.008), day-clustering
-(p=0.0008), and leave-one-series-out. PAPER-TRADE before sizing: see
-docs/MENTION_HAZARD.md.
+fit with cluster-robust SEs on 11,571 (market,tau) snapshots / 264
+ground-truth events (scripts/research_r3_calibration.py; C p=2.3e-12;
+model beats raw price Brier in every family, best in hearings/NHL, the
+two families with significant extra-overpricing dummies). The strategy
+reports p_true; the engine sees market price >> p_true and buys NO as
+TAKER — the edge is not a race (latency-flat at end-60) but it exists
+only at the real ask: never model a fill better than the book.
+
+Default enablement is hearings-only (the certified family), and only
+when the runner confirms the hearing actually convened (one sampled
+hearing was cancelled and Kalshi still batch-closed it two days later).
+PAPER-TRADE FIRST: see docs/MENTION_HAZARD.md for gates and kill bars.
 """
 from __future__ import annotations
 
 import math
-import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from hedge.signal import Signal
 from hedge.strategies.base import MarketView, Strategy
 
-# Calibrated on all settled mention markets (scripts/research_inevent_hazard.py
-# fit, 2026-07-16, n=7,656 market-tau observations, event-clustered):
-#   logit(p_true) = A + B*logit(price) + C*tau
-A = -0.2406
-B = +0.9346
-C = -1.2795
-
-# structural std-error floor: model error dominates sampling error here;
-# residual dispersion of the calibration fit, kept deliberately fat.
-SIGMA_FLOOR = 0.06
-
-# price band where the effect is measured; outside it, abstain.
-PRICE_LO, PRICE_HI = 0.30, 0.70
-TAU_LO, TAU_HI = 0.25, 0.75
-
-# event-window duration (hours) per series prefix — same table the backtest
-# used; the window is anchored at the event's scheduled start, which the
-# runner must supply (see universe()).
-WINDOWS_H = {
-    "KXWCMENTION": 2.5, "KXMLBMENTION": 3.5, "KXNBAMENTION": 3.0,
-    "KXNHLMENTION": 3.0, "KXTRUMPMENTION": 1.5, "KXTRUMPMENTIONB": 1.5,
-    "KXHEARINGMENTION": 3.0, "KXVANCEMENTION": 1.5, "KXMAMDANIMENTION": 1.5,
-    "KXLOVEISLMENTION": 1.5, "KXFIGHTMENTION": 1.0, "KXLATENIGHTMENTION": 1.5,
-    "KXSECPRESSMENTION": 1.0, "KXPOLITICSMENTION": 1.5,
+# r3 theta-decay calibration (family-dummy fit): logit(P_YES) =
+#   A + A_FAM[family] + B*logit(price) + C*tau_true
+# fit: n=11,571 (market,tau) obs, 264 ground-truth events, 2026-07-17,
+# scripts/research_r3_calibration.py (statsmodels Logit, cluster-robust
+# by event). Only NHL and hearings dummies are significant; other
+# families use the WC baseline intercept.
+A = 0.1117
+B = 0.9564
+C = -0.9990
+A_FAM = {
+    "hearings": -1.1676,  # p=0.0001
+    "NHL": -0.7793,       # p=0.0004
 }
 
-_SERIES_RE = re.compile(r"^(KX[A-Z]+)-")
+# event-level residual std at tau=0.7, px 30-60c — conservative (includes
+# Bernoulli outcome noise; pure-model reference is ~0.21). Fat on purpose.
+SIGMA_FLOOR = 0.30
+
+# certified/feasible operating region (fit range 15-85c; trading band and
+# tau window from the certified rule and its anchor-error stress).
+PRICE_LO, PRICE_HI = 0.20, 0.80
+TAU_LO, TAU_HI = 0.40, 0.92
+
+# series prefix -> calibration family. Families outside this table have no
+# ground-truth clock (speech/presser series) — the strategy abstains there.
+FAMILY_BY_PREFIX = {
+    "KXHEARINGMENTION": "hearings",
+    "KXNHLMENTION": "NHL",
+    "KXWCMENTION": "WC",
+    "KXMLBMENTION": "MLB",
+    "KXNBAMENTION": "NBA",
+    "KXEARNINGSMENTION": "earnings",  # prefix-match: per-ticker suffixes
+}
+
+# Families the strategy will actually signal on, by default only the one
+# that cleared the certification bar at real asks. NHL was a near-miss
+# (p=0.011, 19 ev) — enable it explicitly once paper fills support it.
+DEFAULT_ENABLED = frozenset({"hearings"})
+
+
+@dataclass(frozen=True)
+class EventWindow:
+    """Real event window from an EXTERNAL feed (never Kalshi close_time).
+
+    Anchor recipes per family (accuracy at end-60, r3 feasibility study):
+    hearings: committee stream/gavel + liveness check (~87% within +/-60m);
+    NHL/NBA: ESPN live remaining-time by period (med err ~5min);
+    WC: kickoff + 121min (med 2.7min); MLB: StatsAPI inning-half remaining
+    (med 9.7min); earnings: call start + 60min median duration (med 6.8min).
+    """
+
+    start: datetime          # true event start (UTC)
+    end_estimate: datetime   # live best estimate of true end (UTC)
+    confirmed_live: bool = True  # hearings: gavelled and not adjourned
 
 
 class MentionHazard(Strategy):
-    """In-event NO-side hazard signal on word-mention markets."""
+    """In-event NO-side theta-decay signal on word-mention markets."""
 
     name = "mention_hazard"
 
-    def __init__(self, event_starts: dict[str, datetime] | None = None):
-        # event_ticker -> event start (UTC). Live: fed by a schedule source
-        # or the tape-burst onset detector; paper harness fills this in.
-        self.event_starts = event_starts or {}
+    def __init__(
+        self,
+        event_windows: dict[str, EventWindow] | None = None,
+        enabled_families: frozenset[str] = DEFAULT_ENABLED,
+    ):
+        # event_ticker -> EventWindow, maintained by the runner from
+        # external schedule/live feeds. No window, no signal.
+        self.event_windows = event_windows or {}
+        self.enabled_families = enabled_families
 
     def universe(self) -> list[str]:
-        # The runner supplies mention-market tickers whose event window is
-        # near/active; static discovery: all open markets in WINDOWS_H series.
+        # The runner supplies open mention-market tickers for events it
+        # holds a live EventWindow for; static discovery is per-series.
         return []
 
     # ------------------------------------------------------------------
+    def _family(self, ticker: str) -> str | None:
+        for prefix, fam in FAMILY_BY_PREFIX.items():
+            if ticker.startswith(prefix):
+                return fam
+        return None
+
     def _tau(self, market: MarketView) -> float | None:
-        m = _SERIES_RE.match(market.ticker)
-        if not m or m.group(1) not in WINDOWS_H:
-            return None
         event_ticker = market.ticker.rsplit("-", 1)[0]
-        start = self.event_starts.get(event_ticker)
-        if start is None:
+        win = self.event_windows.get(event_ticker)
+        if win is None or not win.confirmed_live:
             return None
-        w_h = WINDOWS_H[m.group(1)]
+        span = (win.end_estimate - win.start).total_seconds()
+        if span <= 0:
+            return None
         now = datetime.now(timezone.utc)
-        tau = (now - start).total_seconds() / (w_h * 3600.0)
-        return tau
+        return (now - win.start).total_seconds() / span
 
     def evaluate(self, market: MarketView) -> Signal | None:
+        family = self._family(market.ticker)
+        if family is None or family not in self.enabled_families:
+            return None
         tau = self._tau(market)
         if tau is None or not (TAU_LO <= tau <= TAU_HI):
             return None
@@ -103,13 +152,18 @@ class MentionHazard(Strategy):
         if price is None or not (PRICE_LO <= price <= PRICE_HI):
             return None
         lp = math.log(price / (1.0 - price))
-        z = A + B * lp + C * tau
+        z = A + A_FAM.get(family, 0.0) + B * lp + C * tau
         p_true = 1.0 / (1.0 + math.exp(-z))
         return Signal(
             ticker=market.ticker,
             prob=p_true,
             std_error=SIGMA_FLOOR,
             strategy=self.name,
-            meta={"tau": round(tau, 3), "mid": price,
-                  "note": "maker-only: execute post_only, small fixed clips"},
+            meta={
+                "family": family,
+                "tau": round(tau, 3),
+                "mid": price,
+                "note": "taker at real NO ask only; never assume a fill "
+                        "inside the spread (r3 certification)",
+            },
         )
