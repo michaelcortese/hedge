@@ -1,0 +1,8 @@
+.venv/
+data/raw/
+data/processed/
+__pycache__/
+*.egg-info/
+artifacts/
+secrets/
+data/odds/
